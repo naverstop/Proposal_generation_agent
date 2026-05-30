@@ -330,8 +330,20 @@ def _render_admin_initial_password_form():
 
 def render_login_page():
     """로그인 안 된 상태에서 보여 줄 전체 페이지."""
-    st.title("🔒 로그인이 필요합니다")
-    st.caption("이 시스템은 관리자가 승인한 계정만 사용할 수 있습니다.")
+    try:
+        from ui_theme import inject_global_css
+        inject_global_css()
+    except Exception:
+        pass
+    st.markdown(
+        """
+        <div class="appx-login-hero">
+            <h1>🔒 AI 제안서 생성기</h1>
+            <p>관리자 승인을 받은 계정으로 로그인해 5단계 마법사를 시작하세요.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     tab1, tab2, tab3 = st.tabs(["로그인", "회원가입 요청", "관리자 초기 비밀번호"])
     with tab1:
         _render_login_form()

@@ -13,10 +13,12 @@ import io
 
 from auth import require_login, render_sidebar_user_panel
 from logging_setup import get_logger
+from ui_theme import inject_global_css, page_header, status_badge
 
 _log = get_logger("HISTORY")
 
 st.set_page_config(page_title="생성 기록 대시보드", layout="wide")
+inject_global_css()
 # --- 인증 가드 ---
 _user = require_login()
 if st.session_state.get("_history_logged_user") != _user["email"]:
@@ -77,53 +79,48 @@ def create_docx_from_db(content):
 
 st.markdown("""
 <style>
-    .stApp {
-        background-color: #F0F8FF;
-    }
-    .stButton>button {
-        border-radius: 8px;
-        border: 1px solid #E2E8F0;
-        color: #334155;
-        font-weight: 600;
-    }
-    .stButton>button:hover {
-        border-color: #2563EB;
-        color: #2563EB;
-    }
-    .stButton>button[kind="primary"] {
-        background-color: #2563EB;
-        color: white;
-    }
+.appx-project-card {
+    background: var(--appx-surface);
+    border: 1px solid var(--appx-border);
+    border-radius: var(--appx-radius-md);
+    padding: 14px 18px;
+    margin-bottom: 10px;
+    box-shadow: var(--appx-shadow-sm);
+    transition: all 0.15s ease;
+}
+.appx-project-card:hover {
+    border-color: var(--appx-primary);
+    transform: translateY(-1px);
+    box-shadow: var(--appx-shadow-md);
+}
+.appx-project-title { font-weight: 700; color: var(--appx-text); font-size: 1rem; margin: 0 0 4px 0; }
+.appx-project-meta  { color: var(--appx-text-muted); font-size: 0.82rem; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🗂️ 생성 기록 대시보드")
-st.info("이곳에서 과거에 생성했던 모든 제안서 프로젝트의 기록을 확인하고 관리할 수 있습니다.")
+page_header(
+    title="🗂️ 생성 기록 대시보드",
+    subtitle="과거에 생성한 모든 제안서 프로젝트를 확인하고 관리합니다.",
+)
 
 search_query = st.text_input("주제 검색:", placeholder="검색할 제안서 주제를 입력하세요...")
 
 projects = load_projects_from_db(search_query)
 
 if not projects:
-    st.warning("아직 생성된 프로젝트 기록이 없거나, 검색 결과가 없습니다.")
+    st.info("아직 생성된 프로젝트 기록이 없거나, 검색 결과가 없습니다.")
 else:
-    col1, col2, col3, col4 = st.columns([1, 4, 2, 3])
-    col1.write("**번호**")
-    col2.write("**제안서 주제**")
-    col3.write("**생성일자**")
-    col4.write("**작업**")
-    st.markdown("---")
-
+    st.caption(f"총 **{len(projects)}개** 프로젝트")
     for project in projects:
-        col1, col2, col3, col4 = st.columns([1, 4, 2, 3])
-        with col1:
-            st.write(project['id'])
-        with col2:
-            st.write(project['topic'])
-        with col3:
-            st.write(project['timestamp'])
-        with col4:
-            b_col1, b_col2 = st.columns(2)
+        with st.container():
+            st.markdown(
+                f'<div class="appx-project-card">'
+                f'  <div class="appx-project-title">#{project["id"]} · {project["topic"] or "(제목 미확정)"}</div>'
+                f'  <div class="appx-project-meta">생성일 {project["timestamp"]}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            b_col1, b_col2, _ = st.columns([1, 1, 4])
             with b_col1:
                 if st.button("상세 보기", key=f"view_{project['id']}", use_container_width=True):
                     if st.session_state.get("selected_project_id_for_view") == project['id']:

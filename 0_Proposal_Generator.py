@@ -32,6 +32,9 @@ from auth import require_login, render_sidebar_user_panel, current_user, is_admi
 from logging_setup import setup_logging, get_logger, log_event
 setup_logging()
 log = get_logger("APP")
+
+# --- 0-2. 공통 UI 테마 ---
+from ui_theme import inject_global_css, page_header, render_stepper
 # Streamlit은 매 인터랙션마다 스크립트를 재실행하므로 1회만 찍는 가드
 if not getattr(setup_logging, "_boot_logged", False):
     log.info("==== 서비스 로딩 시작 (Proposal Generator) ====")
@@ -63,7 +66,7 @@ LLM_SDK_MAX_RETRIES = int(os.getenv("LLM_SDK_MAX_RETRIES", "1"))
 ENHANCEMENT_LOG_LIMIT = 12
 
 st.set_page_config(page_title="AI 제안서 생성기", layout="wide")
-st.title("🤖 AI 제안서/PPT 자동 생성기 (v4.4 Final)")
+inject_global_css()
 # --- 2. 데이터베이스 관리 함수 ---
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.db")
 
@@ -1245,6 +1248,13 @@ if st.session_state.get("_logged_user_email") != auth_user["email"]:
     st.session_state._logged_user_email = auth_user["email"]
 render_sidebar_user_panel()
 
+# --- 인증 통과 후 메인 헤더 ---
+page_header(
+    title="🤖 AI 제안서·PPT 자동 생성기",
+    subtitle="5단계 마법사로 제안서를 작성하고, 자동으로 PPT까지 전환합니다.",
+    meta="v5.0 · 2026",
+)
+
 if 'selected_project_id' in st.session_state and 'project_loaded' not in st.session_state:
     load_project_into_session(st.session_state.selected_project_id)
     st.session_state.project_loaded = True
@@ -1261,35 +1271,21 @@ if st.session_state.get('enhancing'):
 if st.session_state.get('is_generating'):
     st.session_state.is_generating = False
 
-st.markdown("""<style>
-    body { font-family: ' Pretendard', sans-serif; }
-    .stApp { background-color: #F0F8FF; }
-    .stAlert { border-radius: 10px; }
-    div[data-testid="stRadio"] > div[role="radiogroup"] {
-        display: flex; justify-content: center; gap: 10px;
-        margin-bottom: 30px; margin-top: -40px;
-    }
-    div[data-testid="stRadio"] > div[role="radiogroup"] > label {
-        display: inline-block; background-color: #FFFFFF; color: #334155;
-        padding: 12px 0px; margin: 0; border: 1px solid #E2E8F0;
-        border-radius: 10px; cursor: pointer; transition: all 0.3s ease;
-        font-weight: 600; flex-grow: 1; text-align: center;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-    }
-    div[data-testid="stRadio"] > div[role="radiogroup"] > label > div:first-child { display: none; }
-    div[data-testid="stRadio"] > div[role="radiogroup"] > label[aria-checked="true"] {
-        background-color: #1D4ED8 !important; color: white !important;
-        border-color: #1E3A8A !important;
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4) !important;
-    }
-    div[data-testid="stRadio"] > div[role="radiogroup"] > label:not([aria-checked="true"]):hover {
-        background-color: #EFF6FF; border-color: #60A5FA; color: #1E40AF;
-    }
-</style>""", unsafe_allow_html=True)
+# (글로벌 CSS는 ui_theme.inject_global_css()에서 이미 주입됨)
 
 tab_names = ["1단계: 제안서 시작", "2단계: 주제/목차 확정", "3단계: 제안서 생성", "4단계: 최종 품질 검증", "5단계: PPT 전환"]
+stepper_labels = ["제안서 시작", "주제·목차 확정", "제안서 생성", "최종 품질 검증", "PPT 전환"]
 try: active_tab_index = tab_names.index(st.session_state.active_tab)
 except ValueError: active_tab_index = 0; st.session_state.active_tab = tab_names[0]
+
+# --- 단계 진행 상태 스테퍼 (현재 세션 상태로 완료 단계 추정) ---
+_completed = set()
+if st.session_state.get('docs'): _completed.add(0)
+if st.session_state.get('finalized_toc'): _completed.add(1)
+if st.session_state.get('draft_proposal'): _completed.add(2)
+if st.session_state.get('final_proposal'): _completed.add(3)
+render_stepper(stepper_labels, current_index=active_tab_index, completed=_completed)
+
 st.session_state.active_tab = st.radio("Navigation", tab_names, index=active_tab_index, horizontal=True, label_visibility="collapsed")
 
 if st.session_state.active_tab == "1단계: 제안서 시작":

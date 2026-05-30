@@ -1,0 +1,16 @@
+[
+    {
+        "name": "\uc815\ubcf4\ud1b5\uc2e0\uc0b0\uc5c5\uc9c4\ud765\uc6d0 (NIPA)",
+        "url": "https://www.nipa.kr/kr/2/business/businessList.it",
+        "domain": "\uacfc\ud559\uae30\uc220",
+        "type": "\uc911\uc559\uc815\ubd80",
+        "scraper": "scrape_nipa"
+    },
+    {
+        "name": "\ud55c\uad6d\ub370\uc774\ud130\uc0b0\uc5c5\uc9c4\ud765\uc6d0 (K-DATA)",
+        "url": "https://www.kdata.or.kr/kr/board/notice/boardList.do",
+        "domain": "\uacfc\ud559\uae30\uc220",
+        "type": "\uc911\uc559\uc815\ubd80",
+        "scraper": "scrape_kdata"
+    }
+]

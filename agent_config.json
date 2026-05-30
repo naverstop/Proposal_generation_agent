@@ -1,0 +1,15 @@
+{
+    "execution_times": [
+        "09:00",
+        "17:00"
+    ],
+    "recipients": [
+        "user@example.com"
+    ],
+    "crawling_keywords": [
+        "AI",
+        "\uc778\uacf5\uc9c0\ub2a5",
+        "\ub370\uc774\ud130"
+    ],
+    "report_template": "\ub2e4\uc74c\uc740 {agency_name}\uc5d0\uc11c \uc218\uc9d1\ub41c \ucd5c\uc2e0 \uacf5\uace0 \ubaa9\ub85d\uc785\ub2c8\ub2e4.\n\uac01 \uacf5\uace0\uc758 \ud575\uc2ec \ub0b4\uc6a9\uc744 \ubd84\uc11d\ud558\uace0, \uc6b0\ub9ac \ud68c\uc0ac\uc640\uc758 \uad00\ub828\uc131\uc744 \uc911\uc2ec\uc73c\ub85c 3\ubb38\uc7a5 \uc774\ub0b4\ub85c \uc694\uc57d \ubcf4\uace0\ud574\uc8fc\uc138\uc694.\n\n{formatted_announcements}"
+}

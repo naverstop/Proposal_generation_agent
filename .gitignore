@@ -1,0 +1,58 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec
+
+# === 가상환경 ===
+.venv/
+venv/
+env/
+ENV/
+
+# === 환경 변수 (API 키 포함 - 절대 커밋 금지!) ===
+.env
+.env.*
+!.env.example
+
+# === 데이터베이스 ===
+*.db
+*.sqlite
+*.sqlite3
+
+# === 백업 파일 ===
+*.bak
+*_Backup.txt
+back-up_*.txt
+Back_up_*.py
+bbbbbbbbbbbbbb_*
+편집충돌_*
+
+# === 임시/테스트 스크립트 ===
+_*.py
+*.txt.out
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === 로그 ===
+*.log
+logs/
+
+# === 임시 파일 ===
+*.tmp
+*.temp

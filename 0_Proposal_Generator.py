@@ -33,8 +33,10 @@ from logging_setup import setup_logging, get_logger, log_event
 setup_logging()
 log = get_logger("APP")
 
-# --- 0-2. 공통 UI 테마 ---
+# --- 0-2. 공통 UI 테마 / API 상태 ---
 from ui_theme import inject_global_css, page_header, render_stepper
+from api_status import render_api_status_bar
+from ppt_llm import get_ppt_llm
 # Streamlit은 매 인터랙션마다 스크립트를 재실행하므로 1회만 찍는 가드
 if not getattr(setup_logging, "_boot_logged", False):
     log.info("==== 서비스 로딩 시작 (Proposal Generator) ====")
@@ -65,7 +67,7 @@ LLM_TIMEOUT_SECONDS = max(LLM_RETRY_TIMEOUTS)
 LLM_SDK_MAX_RETRIES = int(os.getenv("LLM_SDK_MAX_RETRIES", "1"))
 ENHANCEMENT_LOG_LIMIT = 12
 
-st.set_page_config(page_title="AI 제안서 생성기", layout="wide")
+st.set_page_config(page_title="제안서 & 추진계획서 자동 생성 Agent", layout="wide")
 inject_global_css()
 # --- 2. 데이터베이스 관리 함수 ---
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.db")
@@ -1153,7 +1155,12 @@ def create_docx(content):
     return bio.getvalue()
 
 def generate_ppt_slides(text, pages):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.5, google_api_key=gemini_api_key, max_retries=LLM_SDK_MAX_RETRIES)
+    llm, llm_name = get_ppt_llm(gemini_api_key=gemini_api_key, max_retries=LLM_SDK_MAX_RETRIES, temperature=0.5)
+    log.info(f"PPT 슬라이드 생성 LLM: {llm_name}")
+    try:
+        st.caption(f"🧠 PPT 생성 모델: **{llm_name}**")
+    except Exception:
+        pass
     map_template = """다음은 전체 제안서의 일부 내용입니다. 이 내용을 PPT 슬라이드의 한 부분으로 만들기 위해 핵심 아이디어를 몇 개의 불렛 포인트로 요약해주세요. 내용: {text} 핵심 요약:"""
     map_prompt = PromptTemplate.from_template(map_template)
     reduce_template = """당신은 프레젠테이션 설계 전문가입니다. 아래는 각 파트별로 요약된 제안서의 핵심 내용들입니다. 이 요약본들을 종합하여, 전체적인 논리적 흐름에 맞는 {pages}장 분량의 PPT 슬라이드를 만들어야 합니다. 아래 규칙에 따라 JSON 형식으로만 출력해주세요.
@@ -1250,10 +1257,13 @@ render_sidebar_user_panel()
 
 # --- 인증 통과 후 메인 헤더 ---
 page_header(
-    title="🤖 AI 제안서·PPT 자동 생성기",
-    subtitle="5단계 마법사로 제안서를 작성하고, 자동으로 PPT까지 전환합니다.",
-    meta="v5.0 · 2026",
+    title="🤖 제안서 & 추진계획서 자동 생성 Agent",
+    subtitle="5단계 마법사로 제안서·추진계획서를 작성하고, 자동으로 PPT까지 전환합니다.",
+    meta="v5.1 · 2026",
 )
+
+# --- 외부 API 상태 바 (Google / Gemini / Claude) ---
+render_api_status_bar()
 
 if 'selected_project_id' in st.session_state and 'project_loaded' not in st.session_state:
     load_project_into_session(st.session_state.selected_project_id)

@@ -320,6 +320,36 @@ div[data-testid="stDataFrame"] {
 }
 .appx-step-line-done { background: var(--appx-success); }
 
+/* API Status Bar */
+.appx-api-bar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    padding: 10px 14px; margin: -4px 0 14px 0;
+    background: var(--appx-surface); border: 1px solid var(--appx-border);
+    border-radius: var(--appx-radius-lg); box-shadow: var(--appx-shadow-sm);
+}
+.appx-api-bar-title {
+    font-size: 0.78rem; font-weight: 700; letter-spacing: 0.04em;
+    text-transform: uppercase; color: var(--appx-text-muted);
+    padding-right: 6px; border-right: 1px solid var(--appx-border-strong);
+    margin-right: 4px;
+}
+.appx-api-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 999px;
+    font-size: 0.82rem; font-weight: 600;
+    border: 1px solid transparent;
+    background: var(--appx-surface-2);
+}
+.appx-api-name { font-weight: 700; color: var(--appx-text); }
+.appx-api-msg { color: var(--appx-text-muted); font-size: 0.78rem; }
+.appx-api-dot { font-size: 0.7rem; line-height: 1; }
+.appx-api-ok    { background: var(--appx-success-soft); border-color: var(--appx-success); }
+.appx-api-ok .appx-api-msg { color: var(--appx-success); }
+.appx-api-warn  { background: var(--appx-warning-soft); border-color: var(--appx-warning); }
+.appx-api-warn .appx-api-msg { color: var(--appx-warning); }
+.appx-api-error { background: var(--appx-danger-soft); border-color: var(--appx-danger); }
+.appx-api-error .appx-api-msg { color: var(--appx-danger); font-weight: 700; }
+
 /* Login hero */
 .appx-login-hero {
     background: linear-gradient(135deg, #2563EB 0%, #7C3AED 100%);

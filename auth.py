@@ -338,19 +338,27 @@ def render_login_page():
     st.markdown(
         """
         <div class="appx-login-hero">
-            <h1>🔒 AI 제안서 생성기</h1>
+            <h1>🔒 제안서 & 추진계획서 자동 생성 Agent</h1>
             <p>관리자 승인을 받은 계정으로 로그인해 5단계 마법사를 시작하세요.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    tab1, tab2, tab3 = st.tabs(["로그인", "회원가입 요청", "관리자 초기 비밀번호"])
+
+    # 관리자 계정에 비밀번호가 아직 설정되지 않은 최초 1회만 인라인 초기화 UI 노출
+    try:
+        admin = get_user(ADMIN_EMAIL)
+        if admin and not admin.get("password_hash"):
+            with st.expander(f"🛠 [관리자 전용] 최초 1회 비밀번호 설정 ({ADMIN_EMAIL})", expanded=True):
+                _render_admin_initial_password_form()
+    except Exception:
+        pass
+
+    tab1, tab2 = st.tabs(["로그인", "회원가입 요청"])
     with tab1:
         _render_login_form()
     with tab2:
         _render_register_form()
-    with tab3:
-        _render_admin_initial_password_form()
 
 
 def require_login():

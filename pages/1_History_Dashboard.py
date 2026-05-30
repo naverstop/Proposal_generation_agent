@@ -186,74 +186,122 @@ else:
                     st.info("이 프로젝트의 단계별 기록이 없습니다.")
                 else:
                     stage_dict = {s['stage_name']: s for s in stages}
+
+                    # ─────────────────────────────────────────────
+                    # ① 다운로드 패널 (포인트 컬러 강조)
+                    # ─────────────────────────────────────────────
+                    draft = stage_dict.get("3단계: 본문 생성")
+                    final = stage_dict.get("4단계: 최종본")
+                    citations = stage_dict.get("3단계: 출처 목록")
+                    date_prefix = project['timestamp'].split(' ')[0]
+                    safe_topic = (project['topic'] or 'untitled').strip()
+
+                    st.markdown(
+                        '<div style="background:var(--appx-primary-soft);border-left:4px solid var(--appx-primary);'
+                        'padding:10px 14px;border-radius:6px;margin-bottom:10px;">'
+                        '<div style="font-weight:700;font-size:0.9rem;color:var(--appx-primary-hover);">📦 산출물 다운로드</div>'
+                        '<div style="font-size:0.78rem;color:var(--appx-text-muted);margin-top:2px;">'
+                        '생성된 단계별 파일을 즉시 받을 수 있습니다.</div>'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    d1, d2, d3, d4, d5 = st.columns(5)
+                    with d1:
+                        if draft:
+                            st.download_button(
+                                "📄 초안 DOCX",
+                                data=create_docx_from_db(draft['content']),
+                                file_name=f"[{date_prefix}] {safe_topic}_초안.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                key=f"dl_draft_docx_{project['id']}",
+                                use_container_width=True,
+                                type="primary",
+                            )
+                        else:
+                            st.button("📄 초안 DOCX", key=f"dl_draft_docx_dis_{project['id']}", use_container_width=True, disabled=True)
+                    with d2:
+                        if draft:
+                            st.download_button(
+                                "📃 초안 TXT",
+                                data=draft['content'].encode('utf-8'),
+                                file_name=f"[{date_prefix}] {safe_topic}_초안.txt",
+                                mime="text/plain",
+                                key=f"dl_draft_txt_{project['id']}",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.button("📃 초안 TXT", key=f"dl_draft_txt_dis_{project['id']}", use_container_width=True, disabled=True)
+                    with d3:
+                        if final:
+                            st.download_button(
+                                "✨ 최종본 DOCX",
+                                data=create_docx_from_db(final['content']),
+                                file_name=f"[{date_prefix}] {safe_topic}_최종본.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                key=f"dl_final_docx_{project['id']}",
+                                use_container_width=True,
+                                type="primary",
+                            )
+                        else:
+                            st.button("✨ 최종본 DOCX", key=f"dl_final_docx_dis_{project['id']}", use_container_width=True, disabled=True)
+                    with d4:
+                        if final:
+                            st.download_button(
+                                "📋 최종본 TXT",
+                                data=final['content'].encode('utf-8'),
+                                file_name=f"[{date_prefix}] {safe_topic}_최종본.txt",
+                                mime="text/plain",
+                                key=f"dl_final_txt_{project['id']}",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.button("📋 최종본 TXT", key=f"dl_final_txt_dis_{project['id']}", use_container_width=True, disabled=True)
+                    with d5:
+                        if citations:
+                            st.download_button(
+                                "🔗 출처 TXT",
+                                data=citations['content'].encode('utf-8'),
+                                file_name=f"[{date_prefix}] {safe_topic}_citations.txt",
+                                mime="text/plain",
+                                key=f"dl_cite_txt_{project['id']}",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.button("🔗 출처 TXT", key=f"dl_cite_txt_dis_{project['id']}", use_container_width=True, disabled=True)
+
+                    # ─────────────────────────────────────────────
+                    # ② 후속 작업 네비게이션
+                    # ─────────────────────────────────────────────
+                    n1, n2, _ = st.columns([1, 1, 2])
+                    with n1:
+                        if st.button("🧐 품질 검증으로 이동", key=f"nav_review_{project['id']}", use_container_width=True, disabled=not draft):
+                            st.session_state.selected_project_id = project['id']
+                            st.session_state.active_tab = "4단계: 최종 품질 검증"
+                            st.switch_page("0_Proposal_Generator.py")
+                    with n2:
+                        if st.button("📝 PPT 전환으로 이동", key=f"nav_ppt_{project['id']}", use_container_width=True, disabled=not (final or draft)):
+                            st.session_state.selected_project_id = project['id']
+                            st.session_state.active_tab = "5단계: PPT 전환"
+                            st.switch_page("0_Proposal_Generator.py")
+
+                    st.markdown('<div style="height:6px;"></div>', unsafe_allow_html=True)
+
+                    # ─────────────────────────────────────────────
+                    # ③ 단계별 결과 미리보기 (탭)
+                    # ─────────────────────────────────────────────
                     tab_names = [s.split(': ')[1] for s in stage_dict.keys() if ':' in s]
                     stage_tabs = st.tabs(tab_names)
-                    
+
                     tab_idx = 0
                     for stage_name, stage in stage_dict.items():
                         if ':' not in stage_name: continue
-
                         with stage_tabs[tab_idx]:
-                            st.subheader(f"'{stage['stage_name']}' 결과")
-                            if stage['llm_type']:
-                                st.caption(f"사용된 LLM: {stage['llm_type']}")
-                            
+                            st.caption(f"📌 {stage['stage_name']}" + (f"  ·  LLM: {stage['llm_type']}" if stage['llm_type'] else ""))
                             content = stage['content']
                             try:
                                 parsed_json = json.loads(content)
                                 st.json(parsed_json)
                             except (json.JSONDecodeError, TypeError):
-                                st.text_area("내용", content, height=300, key=f"stage_{project['id']}_{tab_idx}")
-
-                            if stage['stage_name'] == "3단계: 본문 생성":
-                                st.markdown("---")
-                                
-                                button_cols = st.columns(4) 
-                                button_idx = 0
-
-                                button_cols[button_idx].download_button(
-                                    label="📥 초안 DOCX 다운로드",
-                                    data=create_docx_from_db(content),
-                                    file_name=f"[{project['timestamp'].split(' ')[0]}] {project['topic']}_초안.docx",
-                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                    key=f"docx_down_{project['id']}",
-                                    use_container_width=True
-                                )
-                                button_idx += 1
-                                
-                                if "3단계: 출처 목록" in stage_dict:
-                                    button_cols[button_idx].download_button(
-                                        label="📥 출처(.txt) 다운로드",
-                                        data=stage_dict["3단계: 출처 목록"]['content'].encode('utf-8'),
-                                        file_name=f"[{project['timestamp'].split(' ')[0]}] {project['topic']}_citations.txt",
-                                        mime="text/plain",
-                                        key=f"cite_down_{project['id']}",
-                                        use_container_width=True
-                                    )
-                                    button_idx += 1
-
-                                if button_cols[button_idx].button("🧐 품질 검증하기", key=f"review_nav_{project['id']}", use_container_width=True):
-                                    st.session_state.selected_project_id = project['id']
-                                    st.session_state.active_tab = "4단계: 최종 품질 검증"
-                                    st.switch_page("0_Proposal_Generator.py")
-                                button_idx += 1
-                            
-                            if stage['stage_name'] == "4단계: 최종본":
-                                st.markdown("---")
-                                b_col1, b_col2 = st.columns(2)
-                                with b_col1:
-                                    st.download_button(
-                                        label="📥 최종본 DOCX 다운로드",
-                                        data=create_docx_from_db(content),
-                                        file_name=f"[{project['timestamp'].split(' ')[0]}] {project['topic']}_최종본.docx",
-                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                        key=f"final_docx_down_{project['id']}",
-                                        use_container_width=True
-                                    )
-                                with b_col2:
-                                    if st.button("📝 PPT 전환하기", key=f"ppt_nav_{project['id']}", use_container_width=True):
-                                        st.session_state.selected_project_id = project['id']
-                                        st.session_state.active_tab = "5단계: PPT 전환"
-                                        st.switch_page("0_Proposal_Generator.py")
-
+                                st.text_area("내용", content, height=280, key=f"stage_{project['id']}_{tab_idx}", label_visibility="collapsed")
                         tab_idx += 1

@@ -12,10 +12,16 @@ from docx import Document
 import io
 
 from auth import require_login, render_sidebar_user_panel
+from logging_setup import get_logger
+
+_log = get_logger("HISTORY")
 
 st.set_page_config(page_title="생성 기록 대시보드", layout="wide")
 # --- 인증 가드 ---
-require_login()
+_user = require_login()
+if st.session_state.get("_history_logged_user") != _user["email"]:
+    _log.info(f"History 페이지 진입: {_user['email']}")
+    st.session_state._history_logged_user = _user["email"]
 render_sidebar_user_panel()
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "history.db")

@@ -28,6 +28,16 @@ from langchain_google_community import GoogleSearchAPIWrapper
 # --- 0. 인증/회원관리 ---
 from auth import require_login, render_sidebar_user_panel, current_user, is_admin
 
+# --- 0-1. 백엔드 콘솔 로깅 ---
+from logging_setup import setup_logging, get_logger, log_event
+setup_logging()
+log = get_logger("APP")
+# Streamlit은 매 인터랙션마다 스크립트를 재실행하므로 1회만 찍는 가드
+if not getattr(setup_logging, "_boot_logged", False):
+    log.info("==== 서비스 로딩 시작 (Proposal Generator) ====")
+    log.info(f"Python={os.sys.version.split()[0]} CWD={os.getcwd()}")
+    setup_logging._boot_logged = True
+
 # --- 1. 환경변수 및 페이지 설정 ---
 load_dotenv()
 gemini_api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
@@ -210,7 +220,7 @@ def verify_progress_integrity(project_id, stage, expected_keys):
         conn.close()
     except Exception as e:
         print(f"[verify_progress_integrity 중복 점검 실패] {e}")
-    return {
+    report = {
         "expected": len(expected_set),
         "cached": len(cached_set),
         "missing": missing,
@@ -218,6 +228,19 @@ def verify_progress_integrity(project_id, stage, expected_keys):
         "fallback": fallback,
         "duplicates": duplicates,
     }
+    # --- 백엔드 콘솔 로깅 ---
+    _lg = get_logger("VERIFY")
+    _lg.info(
+        f"stage={stage} project={project_id} expected={report['expected']} cached={report['cached']} "
+        f"missing={len(missing)} duplicate={len(duplicates)} orphan={len(orphan)} fallback={len(fallback)}"
+    )
+    if missing:
+        _lg.warning(f"누락 섹션 {len(missing)}개: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    if duplicates:
+        _lg.error(f"중복 섹션 {len(duplicates)}개: {duplicates}")
+    if fallback:
+        _lg.warning(f"폴백 섹션 {len(fallback)}개: {fallback[:5]}{'...' if len(fallback) > 5 else ''}")
+    return report
 
 
 def render_integrity_report(report, title="진행분 검증 결과"):
@@ -248,6 +271,10 @@ def render_integrity_report(report, title="진행분 검증 결과"):
 
 def notify(level, message, toast=True):
     """단계 진행 중 발생하는 알림을 통일된 방식으로 노출. level: 'info'|'success'|'warning'|'error'"""
+    # 콘솔 로깅 (서버 운영자가 백엔드에서 확인)
+    _lg = get_logger("NOTIFY")
+    _level_map = {"info": "info", "success": "info", "warning": "warning", "error": "error"}
+    getattr(_lg, _level_map.get(level, "info"))(f"[{level.upper()}] {message}")
     fn = {"info": st.info, "success": st.success, "warning": st.warning, "error": st.error}.get(level, st.info)
     try:
         fn(message)
@@ -660,6 +687,10 @@ def _notify_llm_retry(kind, attempt_index, total_attempts, exc):
         "error": f"⚠️ LLM 오류 시도 {attempt_index}/{total_attempts}: {type(exc).__name__}",
     }
     msg = msg_map.get(kind, str(exc))
+    # 콘솔 로깅 (백엔드 운영자에게 즉시 가시화)
+    _lg = get_logger("LLM")
+    log_level = "error" if kind in ("deadline_504",) else "warning"
+    getattr(_lg, log_level)(f"retry={kind} attempt={attempt_index}/{total_attempts} err={type(exc).__name__}: {exc}")
     try:
         st.toast(msg, icon="🚨" if kind == "deadline_504" else "⚠️")
         if kind == "deadline_504" and attempt_index == total_attempts:
@@ -668,7 +699,7 @@ def _notify_llm_retry(kind, attempt_index, total_attempts, exc):
                 "잠시 후 '🔁 이어서 재실행' 버튼을 사용하시면 폴백 섹션만 다시 시도합니다."
             )
     except Exception:
-        print(f"[llm-retry-{kind}] attempt={attempt_index}/{total_attempts} err={exc}")
+        pass
 
 def call_llm_api_for_body_processing(prompt_text, attempt_timeout=LLM_TIMEOUT_SECONDS):
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.5, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
@@ -1203,9 +1234,15 @@ def reset_all_state():
     for key in keys_to_clear: del st.session_state[key]
 
 init_db()
+if not getattr(setup_logging, "_db_logged", False):
+    get_logger("DB").info(f"DB 초기화 완료 (WAL): {DB_FILE}")
+    setup_logging._db_logged = True
 
 # --- 인증 가드 (모든 페이지 진입 전에 호출) ---
 auth_user = require_login()
+if st.session_state.get("_logged_user_email") != auth_user["email"]:
+    get_logger("AUTH").info(f"로그인 사용자: {auth_user['email']} (role={auth_user['role']})")
+    st.session_state._logged_user_email = auth_user["email"]
 render_sidebar_user_panel()
 
 if 'selected_project_id' in st.session_state and 'project_loaded' not in st.session_state:
@@ -1454,6 +1491,10 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
         llm_type = "OpenAI"
 
         try:
+            get_logger("STAGE3").info(
+                f"start project={st.session_state.project_id} sections={st.session_state.total_sections} "
+                f"page_count={page_count} citations={use_citations}"
+            )
             for i, current_heading in enumerate(all_headings):
                 st.session_state.current_section_index = i
                 if st.session_state.get('generation_stopped'):
@@ -1540,6 +1581,11 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                         status="ok" if not generated_content.startswith("[") else "fallback_original",
                         elapsed_sec=elapsed_sec,
                     )
+                    get_logger("STAGE3").info(
+                        f"section {i+1}/{st.session_state.total_sections} '{current_heading}' "
+                        f"saved status={'ok' if not generated_content.startswith('[') else 'fallback'} "
+                        f"elapsed={elapsed_sec:.1f}s"
+                    )
 
                 else:
                     status_text.text(f"➡️ ({i+1}/{st.session_state.total_sections}) '{current_heading}' 상위 목차 추가 (본문 생성 건너뜀)")
@@ -1574,10 +1620,12 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                     save_stage_result(st.session_state.project_id, "3단계: 본문 생성", full_proposal.strip(), llm_type)
                     notify("info", "중단 시점까지의 부분 초안을 저장했습니다. 다시 '시작'을 누르면 남은 섹션부터 이어서 생성합니다.")
         except Exception as _stage3_exc:
+            get_logger("STAGE3").exception(f"치명적 오류: {_stage3_exc}")
             notify("error", f"🚨 3단계 실행 중 치명적 오류: {_stage3_exc}. 진행분은 DB에 보존되어 재실행 시 자동 재사용됩니다.")
         finally:
             # (P1-3) 어떤 경우에도 is_generating 플래그 해제
             st.session_state.is_generating = False
+            get_logger("STAGE3").info("end (is_generating=False)")
         st.rerun()
 
     if 'draft_proposal' in st.session_state:
@@ -1731,6 +1779,9 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                            f"4단계 진입 — 본문 {(_entry_body or {}).get('count', 0)}건 / "
                            f"목차 {(_entry_toc or {}).get('count', 0)}건 재사용 예정.")
                 try:
+                    get_logger("STAGE4").info(
+                        f"start project={project_id} resume={st.session_state.get('resume_stage4', True)}"
+                    )
                     final_proposal_text = enhance_proposal(
                         st.session_state.draft_to_enhance,
                         review_criteria,
@@ -1758,6 +1809,7 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                     clear_progress(project_id, "stage4_enhance_toc")
                     st.session_state.resume_stage4 = False
                 except Exception as _stage4_exc:
+                    get_logger("STAGE4").exception(f"치명적 오류: {_stage4_exc}")
                     notify("error",
                            f"🚨 4단계 강화 중 치명적 오류: {_stage4_exc}. "
                            "진행분은 DB에 보존되어 재실행 시 자동 재사용됩니다.")
@@ -1765,6 +1817,7 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                     # 예외/리로드 시에도 플래그를 반드시 해제 → LLM 폭주 방지 (P1-3)
                     st.session_state.enhancing = False
                     if 'draft_to_enhance' in st.session_state: del st.session_state['draft_to_enhance']
+                    get_logger("STAGE4").info("end (enhancing=False)")
                 st.rerun()
 
             if 'final_proposal' in st.session_state:

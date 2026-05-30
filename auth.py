@@ -13,6 +13,13 @@ import secrets
 import datetime
 import streamlit as st
 
+try:
+    from logging_setup import get_logger
+    _log = get_logger("AUTH")
+except Exception:
+    import logging
+    _log = logging.getLogger("auth")
+
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.db")
 ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "orion0321@gmail.com").strip().lower()
 
@@ -168,6 +175,7 @@ def register_user(email: str, password: str) -> tuple[bool, str]:
     )
     conn.commit()
     conn.close()
+    _log.info(f"회원가입 요청 접수 (승인대기): {email}")
     return True, "회원가입 요청이 접수되었습니다. 관리자 승인 후 사용 가능합니다."
 
 
@@ -182,6 +190,8 @@ def approve_user(email: str, by_admin: str) -> bool:
     changed = c.rowcount
     conn.commit()
     conn.close()
+    if changed > 0:
+        _log.info(f"승인: {email} by {by_admin}")
     return changed > 0
 
 
@@ -195,6 +205,8 @@ def reject_user(email: str, by_admin: str, note: str = "") -> bool:
     changed = c.rowcount
     conn.commit()
     conn.close()
+    if changed > 0:
+        _log.warning(f"거절: {email} by {by_admin}")
     return changed > 0
 
 
@@ -217,15 +229,19 @@ def authenticate(email: str, password: str) -> tuple[bool, str, dict | None]:
     email = (email or "").strip().lower()
     user = get_user(email)
     if not user:
+        _log.warning(f"로그인 실패 (미등록): {email}")
         return False, "등록되지 않은 이메일입니다.", None
     if user["status"] == "pending":
+        _log.warning(f"로그인 차단 (승인대기): {email}")
         return False, "관리자 승인 대기 중입니다. 관리자에게 문의하세요.", None
     if user["status"] == "rejected":
+        _log.warning(f"로그인 차단 (거절됨): {email}")
         return False, "가입이 거절되었습니다. 관리자에게 문의하세요.", None
     if not user["password_hash"]:
-        # 관리자 초기 상태(비밀번호 미설정)인 경우 — 로그인 화면에서 별도 처리
+        _log.info(f"관리자 초기 비밀번호 미설정: {email}")
         return False, "초기 비밀번호가 설정되지 않았습니다. '관리자 초기 비밀번호 설정' 탭을 사용하세요.", None
     if not _verify_password(email, password):
+        _log.warning(f"로그인 실패 (비밀번호 불일치): {email}")
         return False, "비밀번호가 일치하지 않습니다.", None
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = _connect()
@@ -234,6 +250,7 @@ def authenticate(email: str, password: str) -> tuple[bool, str, dict | None]:
     conn.commit()
     conn.close()
     user["last_login_at"] = now
+    _log.info(f"로그인 성공: {email} role={user['role']}")
     return True, "로그인 성공", user
 
 

@@ -41,8 +41,11 @@ def _temperature_deprecated(model_id: str) -> bool:
     return False
 
 
-def get_ppt_llm(gemini_api_key: str, max_retries: int = 1, temperature: float = 0.5) -> Tuple[object, str]:
-    """PPT 생성용 LLM을 반환. Claude > Gemini 순으로 시도."""
+def get_ppt_llm(gemini_api_key: str, max_retries: int = 1, temperature: float = 0.5, timeout_override: int = None) -> Tuple[object, str]:
+    """PPT 생성용 LLM을 반환. Claude > Gemini 순으로 시도.
+
+    timeout_override: 단일 SDK 호출 timeout(초). 미지정 시 Claude=120s, Gemini=SDK 기본.
+    """
     claude_key = (os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or "").strip()
     # llm_config.claude_model() 이 .env override + 자동 디스커버리(1h 캐시)를 모두 처리한다.
     try:
@@ -60,7 +63,7 @@ def get_ppt_llm(gemini_api_key: str, max_retries: int = 1, temperature: float = 
                 model=claude_model,
                 api_key=claude_key,
                 max_tokens=4096,
-                timeout=120,
+                timeout=int(timeout_override) if timeout_override else 120,
                 max_retries=max_retries,
             )
             if not _temperature_deprecated(claude_model):
@@ -80,11 +83,14 @@ def get_ppt_llm(gemini_api_key: str, max_retries: int = 1, temperature: float = 
         model_name = gemini_pro_model()
     except Exception:
         model_name = "gemini-pro-latest"
-    llm = ChatGoogleGenerativeAI(
+    llm_kwargs = dict(
         model=model_name,
         temperature=temperature,
         google_api_key=gemini_api_key,
         max_retries=max_retries,
     )
+    if timeout_override:
+        llm_kwargs["timeout"] = int(timeout_override)
+    llm = ChatGoogleGenerativeAI(**llm_kwargs)
     _log.info(f"PPT LLM = Gemini ({model_name})")
     return llm, f"Gemini · {model_name}"

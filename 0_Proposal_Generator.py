@@ -62,6 +62,9 @@ def _parse_retry_timeouts(raw_value, default_sequence):
 
 LLM_RETRY_TIMEOUTS = _parse_retry_timeouts(os.getenv("LLM_RETRY_TIMEOUTS", "60,120"), [60, 120])
 LLM_TIMEOUT_SECONDS = max(LLM_RETRY_TIMEOUTS)
+# PPT 생성 전용 단계 재시도 타임아웃(초). 기본 5분 × 4회 = 최대 20분.
+# map_reduce 체인이 청크별 LLM 호출을 다수 수행하므로 단일 호출보다 넉넉하게 둔다.
+PPT_RETRY_TIMEOUTS = _parse_retry_timeouts(os.getenv("PPT_RETRY_TIMEOUTS", "300,300,300,300"), [300, 300, 300, 300])
 # Gemini SDK(langchain_google_genai) 내부 tenacity 재시도 횟수.
 # 기본값 6은 너무 커서 504(DeadlineExceeded)가 반복되면 한 시도가 수 분씩 늘어진다.
 # 우리 execute_with_retries가 시도 자체를 한번 더 감싸므로 SDK는 1회만 시도하도록 낮춘다.
@@ -1155,9 +1158,15 @@ def create_docx(content):
     document.save(bio)
     return bio.getvalue()
 
-def generate_ppt_slides(text, pages):
-    llm, llm_name = get_ppt_llm(gemini_api_key=gemini_api_key, max_retries=LLM_SDK_MAX_RETRIES, temperature=0.5)
-    log.info(f"PPT 슬라이드 생성 LLM: {llm_name}")
+def generate_ppt_slides(text, pages, attempt_timeout=None):
+    sdk_timeout = int(attempt_timeout) if attempt_timeout else None
+    llm, llm_name = get_ppt_llm(
+        gemini_api_key=gemini_api_key,
+        max_retries=LLM_SDK_MAX_RETRIES,
+        temperature=0.5,
+        timeout_override=sdk_timeout,
+    )
+    log.info(f"PPT 슬라이드 생성 LLM: {llm_name} (SDK timeout={sdk_timeout}s)")
     try:
         st.caption(f"🧠 PPT 생성 모델: **{llm_name}**")
     except Exception:
@@ -1929,18 +1938,103 @@ elif st.session_state.active_tab == "5단계: PPT 전환":
             if st.button("🚀 PPT 생성 시작하기", type="primary", use_container_width=True):
                 if 'generated_ppt_file' in st.session_state:
                     del st.session_state['generated_ppt_file']
-                with st.status("PPT 생성을 시작합니다...", expanded=True) as status:
-                    status.write("1/3: AI가 제안서 내용을 분석 및 요약 중입니다...")
-                    slides_json_str = generate_ppt_slides(proposal_content, ppt_page_count)
+                total_budget_min = sum(PPT_RETRY_TIMEOUTS) // 60
+                ppt_log_lines: list[str] = []
+                with st.status(
+                    f"PPT 생성을 시작합니다 (최대 {len(PPT_RETRY_TIMEOUTS)}회 × {PPT_RETRY_TIMEOUTS[0]//60}분 = 총 {total_budget_min}분 대기)...",
+                    expanded=True,
+                ) as status:
+                    progress_bar = st.progress(0, text="대기 중...")
+                    ppt_log_container = st.empty()
+                    # closure 상태(가변): 이전 표시된 정수 진척률, 현재 시도 번호
+                    _state = {"last_pct": -1, "attempt_idx": 0, "attempt_total": len(PPT_RETRY_TIMEOUTS)}
+
+                    def _fmt_mmss(sec: int) -> str:
+                        sec = max(0, int(sec))
+                        return f"{sec // 60:02d}:{sec % 60:02d}"
+
+                    def _push_ppt_log(message: str):
+                        ts = datetime.datetime.now().strftime("%H:%M:%S")
+                        ppt_log_lines.append(f"[{ts}] {message}")
+                        ppt_log_container.text(
+                            "📜 PPT 진행 로그\n" + "\n".join(ppt_log_lines[-30:])
+                        )
+
+                    log.info(f"PPT 생성 시작 | 정책={PPT_RETRY_TIMEOUTS} (총 {total_budget_min}분)")
+                    _push_ppt_log(f"PPT 생성 시작 — 단계 정책 {PPT_RETRY_TIMEOUTS}초 (총 {total_budget_min}분)")
+
+                    def _on_attempt(idx, total, t):
+                        _state["last_pct"] = -1
+                        _state["attempt_idx"] = idx
+                        _state["attempt_total"] = total
+                        msg = f"▶ 시도 {idx}/{total} 시작 — 제한 {t}초 ({t//60}분 {t%60:02d}초)"
+                        status.write(f"1/3: {msg} — AI가 제안서 내용을 분석/요약 중입니다...")
+                        progress_bar.progress(0, text=f"시도 {idx}/{total} · 0% · 잔여 {_fmt_mmss(t)}")
+                        _push_ppt_log(msg)
+                        log.info(f"PPT 시도 {idx}/{total} 시작 — 제한 {t}s")
+
+                    def _on_wait(elapsed, t, idx, total):
+                        if t <= 0:
+                            return
+                        pct = int(elapsed / t * 100)
+                        if pct < 0:
+                            pct = 0
+                        if pct > 100:
+                            pct = 100
+                        if pct == _state["last_pct"]:
+                            return  # 변경 없음 → UI 갱신 생략
+                        _state["last_pct"] = pct
+                        remaining = max(0, int(t - elapsed))
+                        progress_bar.progress(
+                            pct,
+                            text=f"시도 {idx}/{total} · {pct}% · 경과 {_fmt_mmss(elapsed)} / 제한 {_fmt_mmss(t)} · 잔여 {_fmt_mmss(remaining)}",
+                        )
+                        # 5% 단위로만 로그/콘솔 기록 (UI는 1%마다 갱신, 로그는 시끄럽지 않게)
+                        if pct % 5 == 0:
+                            line = f"⏳ 시도 {idx}/{total} — {pct}% · 경과 {_fmt_mmss(elapsed)} / 제한 {_fmt_mmss(t)} · 잔여 {_fmt_mmss(remaining)}"
+                            _push_ppt_log(line)
+                            log.info(f"PPT 시도 {idx}/{total} 진행 {pct}% — elapsed={int(elapsed)}s remaining={remaining}s")
+
+                    slides_json_str = None
+                    try:
+                        slides_json_str = execute_with_retries(
+                            generate_ppt_slides,
+                            proposal_content,
+                            ppt_page_count,
+                            timeouts=PPT_RETRY_TIMEOUTS,
+                            on_attempt=_on_attempt,
+                            on_wait=_on_wait,
+                        )
+                    except TimeoutError as e:
+                        log.error(f"PPT 슬라이드 생성 최종 타임아웃: {e}")
+                        _push_ppt_log(f"⛔ 최종 타임아웃: {e}")
+                        progress_bar.progress(100, text="⛔ 모든 시도 타임아웃")
+                        status.update(label=f"⛔ {len(PPT_RETRY_TIMEOUTS)}회 시도 모두 시간 초과 — 잠시 후 재시도해주세요.", state="error")
+                    except Exception as e:
+                        log.exception("PPT 슬라이드 생성 중 예외")
+                        _push_ppt_log(f"⛔ 예외: {type(e).__name__}: {e}")
+                        progress_bar.progress(100, text=f"⛔ 오류: {type(e).__name__}")
+                        status.update(label=f"⛔ PPT 생성 실패: {e}", state="error")
                     if slides_json_str:
+                        _push_ppt_log("✅ 요약 단계 성공 → PPT 파일 조립 시작")
+                        log.info("PPT 슬라이드 JSON 수신 완료 → 파일 조립")
+                        progress_bar.progress(100, text="✅ 요약 완료 · 파일 조립 중...")
                         status.write("2/3: 요약된 내용을 바탕으로 PPT 파일을 조립하고 있습니다...")
                         ppt_file = create_ppt_presentation(slides_json_str, theme_name)
                         if ppt_file:
                             st.session_state.generated_ppt_file = ppt_file
+                            _push_ppt_log("🎉 PPT 파일 조립 완료")
+                            log.info("PPT 파일 조립 완료")
+                            progress_bar.progress(100, text="🎉 완료")
                             status.write("3/3: 생성 완료! 다운로드 버튼을 준비합니다.")
                             status.update(label="🎉 PPT 생성이 완료되었습니다!", state="complete")
                         else:
+                            _push_ppt_log("⛔ PPT 파일 조립 실패")
+                            log.error("PPT 파일 조립 실패")
                             status.update(label="오류: PPT 파일 조립 실패", state="error")
+                    elif slides_json_str is None:
+                        # 예외 없이 빈 결과인 경우 — 위 except에서 이미 처리됨
+                        pass
                     else:
                         status.update(label="오류: AI 요약 실패", state="error")
 

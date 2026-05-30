@@ -159,6 +159,8 @@ def resolve_gemini_version(model_id: str) -> str:
         return resolved
     except Exception as e:
         _log.warning(f"Gemini resolve 실패 ({model_id}): {type(e).__name__}: {e}")
+        # 실패도 짧게(60초) 캐시하여 SSL 일시 오류 시 호출 폭주 방지.
+        _GEMINI_RESOLVED_CACHE[model_id] = {"version": model_id, "ts": now - (_GEMINI_RESOLVED_TTL - 60)}
         return model_id
 
 

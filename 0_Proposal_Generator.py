@@ -1240,9 +1240,34 @@ def create_ppt_presentation(slides_json, theme_name):
     return bio.getvalue()
 
 # --- 4. 스트림릿 UI 구성 ---
+# 세션 리셋 시 절대 지워서는 안 되는 키 목록 (인증·전역 도구·UI 상태).
+# - auth_*  : 로그인 세션 (제거 시 로그인 화면으로 강제 이동되는 버그 발생)
+# - _logged_user_email / _history_logged_user : 로그인 1회만 INFO 로깅하기 위한 가드 캐시
+# - Google Search : @st.cache가 아닌 일반 세션 슬롯에 보관된 검색 도구 인스턴스
+# - active_tab : 현재 탭 위치
+# - selected_project_id / project_loaded : 대시보드에서 진입한 프로젝트 로딩 가드
+_PRESERVED_SESSION_KEYS = {
+    "auth_user",
+    "auth_login_time",
+    "_logged_user_email",
+    "_history_logged_user",
+    "Google Search",
+    "active_tab",
+}
+
+
 def reset_all_state():
-    keys_to_clear = [key for key in st.session_state if key not in ['Google Search', 'active_tab', 'project_id']]
-    for key in keys_to_clear: del st.session_state[key]
+    """현재 프로젝트 진행 상태(자료/주제/목차/본문/최종본 등)만 비운다.
+
+    인증·UI·도구 인스턴스 등 시스템 키는 _PRESERVED_SESSION_KEYS로 보존하며,
+    auth_* 등 보안 관련 키는 항상 유지된다 (제거 시 즉시 로그인 화면으로 튕김).
+    """
+    keys_to_clear = [
+        key for key in list(st.session_state.keys())
+        if key not in _PRESERVED_SESSION_KEYS and not key.startswith("auth_")
+    ]
+    for key in keys_to_clear:
+        del st.session_state[key]
 
 init_db()
 if not getattr(setup_logging, "_db_logged", False):

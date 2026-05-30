@@ -1117,7 +1117,7 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
         return draft_text
 
 def generate_overview_section(full_proposal_text, topic, attempt_timeout=LLM_TIMEOUT_SECONDS):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.5, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
+    llm = ChatGoogleGenerativeAI(model=gemini_pro_model(), temperature=0.5, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
     text_to_summarize = full_proposal_text.replace("[사업 개요는 최종본 생성 시 자동으로 채워집니다.]", "").strip()
     if "## 목차" in text_to_summarize:
         text_to_summarize = text_to_summarize.split("## 목차", 1)[1]
@@ -1291,9 +1291,10 @@ page_header(
 # --- 외부 API 상태 바 (Google / Gemini / Claude) ---
 render_api_status_bar()
 
-if 'selected_project_id' in st.session_state and 'project_loaded' not in st.session_state:
+if 'selected_project_id' in st.session_state and \
+        st.session_state.get('project_loaded') != st.session_state.selected_project_id:
     load_project_into_session(st.session_state.selected_project_id)
-    st.session_state.project_loaded = True
+    st.session_state.project_loaded = st.session_state.selected_project_id
 
 if 'Google Search' not in st.session_state: st.session_state['Google Search'] = get_search_tool()
 if 'active_tab' not in st.session_state: st.session_state.active_tab = "1단계: 제안서 시작"

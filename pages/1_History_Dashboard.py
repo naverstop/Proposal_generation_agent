@@ -1,11 +1,22 @@
 # pages/1_History_Dashboard.py
+import sys
+import os
+# 상위 폴더(루트)의 auth 모듈을 import 할 수 있도록 경로 추가
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import streamlit as st
 import sqlite3
-import os
 import pandas as pd
 import json
 from docx import Document
 import io
+
+from auth import require_login, render_sidebar_user_panel
+
+st.set_page_config(page_title="생성 기록 대시보드", layout="wide")
+# --- 인증 가드 ---
+require_login()
+render_sidebar_user_panel()
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "history.db")
 
@@ -57,8 +68,6 @@ def create_docx_from_db(content):
     bio = io.BytesIO()
     document.save(bio)
     return bio.getvalue()
-
-st.set_page_config(page_title="생성 기록 대시보드", layout="wide")
 
 st.markdown("""
 <style>

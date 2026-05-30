@@ -25,6 +25,9 @@ from pptx.dml.color import RGBColor
 from langchain_core.output_parsers import StrOutputParser
 from langchain_google_community import GoogleSearchAPIWrapper
 
+# --- 0. 인증/회원관리 ---
+from auth import require_login, render_sidebar_user_panel, current_user, is_admin
+
 # --- 1. 환경변수 및 페이지 설정 ---
 load_dotenv()
 gemini_api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
@@ -47,8 +50,6 @@ ENHANCEMENT_LOG_LIMIT = 12
 
 st.set_page_config(page_title="AI 제안서 생성기", layout="wide")
 st.title("🤖 AI 제안서/PPT 자동 생성기 (v4.4 Final)")
-
-
 # --- 2. 데이터베이스 관리 함수 ---
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.db")
 
@@ -173,7 +174,87 @@ def get_progress_summary(project_id, stage):
     if not items:
         return None
     latest = max((v.get("updated_at") or "") for v in items.values())
-    return {"count": len(items), "latest": latest}
+    fallbacks = [k for k, v in items.items() if (v.get("status") == "fallback_original")]
+    return {"count": len(items), "latest": latest, "fallback_count": len(fallbacks), "fallback_keys": fallbacks}
+
+
+def verify_progress_integrity(project_id, stage, expected_keys):
+    """
+    재실행/이어서 실행 직전에 누락·중복·고아 항목을 점검한다.
+    - missing : expected에 있지만 stage_progress에 없음
+    - duplicate : (UNIQUE 제약으로 거의 없으나) 같은 section_key가 2회 이상 저장된 경우
+    - orphan : DB엔 있지만 현재 expected에 없는 키 (목차가 바뀐 경우)
+    - fallback : status='fallback_original'로 저장된 항목 (재시도 권장)
+    """
+    items = load_progress_map(project_id, stage)
+    expected_set = {str(k).strip() for k in (expected_keys or []) if str(k).strip()}
+    cached_set = set(items.keys())
+    missing = sorted(expected_set - cached_set)
+    orphan = sorted(cached_set - expected_set)
+    fallback = sorted([k for k, v in items.items() if v.get("status") == "fallback_original"])
+    # 중복 점검 (UNIQUE 제약이 있더라도 방어적으로 COUNT)
+    duplicates = []
+    try:
+        conn = _connect_db()
+        c = conn.cursor()
+        c.execute(
+            "SELECT section_key, COUNT(*) AS n FROM stage_progress "
+            "WHERE project_id = ? AND stage = ? GROUP BY section_key HAVING n > 1",
+            (project_id, stage),
+        )
+        duplicates = [row[0] for row in c.fetchall()]
+        conn.close()
+    except Exception as e:
+        print(f"[verify_progress_integrity 중복 점검 실패] {e}")
+    return {
+        "expected": len(expected_set),
+        "cached": len(cached_set),
+        "missing": missing,
+        "orphan": orphan,
+        "fallback": fallback,
+        "duplicates": duplicates,
+    }
+
+
+def render_integrity_report(report, title="진행분 검증 결과"):
+    """검증 리포트를 사용자에게 보여 주는 공용 UI."""
+    if not report:
+        return
+    cols = st.columns(4)
+    cols[0].metric("예상 섹션", report["expected"])
+    cols[1].metric("저장된 섹션", report["cached"])
+    cols[2].metric("누락", len(report["missing"]), delta_color="inverse")
+    cols[3].metric("폴백/중복/고아", len(report["fallback"]) + len(report["duplicates"]) + len(report["orphan"]),
+                   delta_color="inverse")
+    if report["missing"]:
+        with st.expander(f"⛔ 누락 섹션 {len(report['missing'])}개 (재실행 시 새로 생성됨)", expanded=True):
+            for k in report["missing"]:
+                st.caption(f"• {k}")
+    if report["fallback"]:
+        with st.expander(f"⚠️ 폴백(원문 유지) 섹션 {len(report['fallback'])}개 — 다시 시도하면 재생성됩니다", expanded=False):
+            for k in report["fallback"]:
+                st.caption(f"• {k}")
+    if report["duplicates"]:
+        st.error(f"🚨 중복 저장된 섹션 {len(report['duplicates'])}개 발견: {', '.join(report['duplicates'])}")
+    if report["orphan"]:
+        with st.expander(f"🧹 현재 목차에 없는 잔여 항목 {len(report['orphan'])}개 (목차 변경 흔적)", expanded=False):
+            for k in report["orphan"]:
+                st.caption(f"• {k}")
+
+
+def notify(level, message, toast=True):
+    """단계 진행 중 발생하는 알림을 통일된 방식으로 노출. level: 'info'|'success'|'warning'|'error'"""
+    fn = {"info": st.info, "success": st.success, "warning": st.warning, "error": st.error}.get(level, st.info)
+    try:
+        fn(message)
+    except Exception:
+        print(f"[notify-{level}] {message}")
+    if toast:
+        icon = {"info": "ℹ️", "success": "✅", "warning": "⚠️", "error": "🚨"}.get(level, "ℹ️")
+        try:
+            st.toast(message, icon=icon)
+        except Exception:
+            pass
 
 def create_new_project():
     conn = sqlite3.connect(DB_FILE)
@@ -917,8 +998,10 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
                     project_id, "stage4_enhance_toc", item.get("original_line", item['text']),
                     item['text'], status="fallback_original" if warning_message else "ok",
                 )
-            except Exception:
-                pass
+            except Exception as _se:
+                # 목차 진행분 저장 실패는 사용자에게도 알린다 (재실행/이어서 진행에 영향)
+                notify("warning", f"목차 진행분 저장 실패: {_se}. 재실행 시 이 항목은 다시 처리됩니다.")
+                append_enhancement_log(log_container, logs, f"⚠️ 목차 진행분 저장 실패: {_se}")
 
         refined_toc = refine_table_of_contents(
             original_toc,
@@ -1090,6 +1173,10 @@ def reset_all_state():
     for key in keys_to_clear: del st.session_state[key]
 
 init_db()
+
+# --- 인증 가드 (모든 페이지 진입 전에 호출) ---
+auth_user = require_login()
+render_sidebar_user_panel()
 
 if 'selected_project_id' in st.session_state and 'project_loaded' not in st.session_state:
     load_project_into_session(st.session_state.selected_project_id)
@@ -1284,13 +1371,26 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                 f"이전에 생성하다 중단된 본문이 {stage3_summary['count']}개 남아 있습니다 (마지막 {stage3_summary['latest']}). "
                 "다시 시작하면 처리된 섹션은 LLM 재호출 없이 재사용됩니다."
             )
+            # 현재 목차 기준 누락/중복 검증 리포트
+            try:
+                _expected_headings = [
+                    line.strip() for line in (st.session_state.get('finalized_toc', '') or '').split('\n')
+                    if line.strip() and not line.strip().startswith('#')
+                ]
+                _rep = verify_progress_integrity(st.session_state.project_id, "stage3_body", _expected_headings)
+                render_integrity_report(_rep, title="3단계 진행분 검증")
+                if _rep["duplicates"]:
+                    notify("error", f"3단계 진행분에 중복 섹션 {len(_rep['duplicates'])}건이 감지됐습니다. '처음부터' 버튼을 권장합니다.")
+            except Exception as _verr:
+                notify("warning", f"3단계 진행분 검증 중 오류: {_verr}")
+
             rs1, rs2 = st.columns(2)
             with rs1:
                 st.caption("▶ '제안서 생성 시작'을 누르면 자동으로 이어서 진행됩니다.")
             with rs2:
                 if st.button("🗑 이전 진행분 비우고 처음부터", use_container_width=True, key="reset_stage3_progress"):
                     clear_progress(st.session_state.project_id, "stage3_body")
-                    st.success("이전 진행분을 비웠습니다.")
+                    notify("success", "이전 진행분을 비웠습니다. 처음부터 다시 생성됩니다.")
                     st.rerun()
         if st.button("🚀 제안서 생성 시작하기", use_container_width=True):
             if 'draft_proposal' in st.session_state: del st.session_state['draft_proposal']
@@ -1386,10 +1486,10 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                             )
                     except TimeoutError:
                         total_budget = sum(LLM_RETRY_TIMEOUTS)
-                        st.warning(f"⚠️ '{current_heading}' 생성이 {len(LLM_RETRY_TIMEOUTS)}회 재시도(총 {total_budget}초) 안에 끝나지 않아 빈 본문으로 진행합니다.")
+                        notify("warning", f"⚠️ '{current_heading}' 생성이 {len(LLM_RETRY_TIMEOUTS)}회 재시도(총 {total_budget}초) 안에 끝나지 않아 빈 본문으로 진행합니다.")
                         generated_content = f"[자동 생성 실패: 시간 초과 - '{current_heading}']"
                     except Exception as e:
-                        st.error(f"'{current_heading}' 섹션 생성 중 오류 발생: {e}")
+                        notify("error", f"'{current_heading}' 섹션 생성 중 오류 발생: {e}")
                         generated_content = f"[오류: '{current_heading}' 생성 실패 - {e}]"
 
                     cleaned_section_title = re.sub(r"^\d+(\.\d+)*\s*", "", current_heading).strip()
@@ -1421,6 +1521,20 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                 if all_citations:
                     st.session_state.citations = all_citations.strip()
                     save_stage_result(st.session_state.project_id, "3단계: 출처 목록", st.session_state.citations)
+                # --- 완료 직전 누락/중복 검증 (사용자 요구사항) ---
+                completion_report = verify_progress_integrity(
+                    st.session_state.project_id, "stage3_body", all_headings
+                )
+                if completion_report["missing"] or completion_report["duplicates"]:
+                    notify("error",
+                           f"🚨 3단계 완료 후 검증 실패 — 누락 {len(completion_report['missing'])}건 / "
+                           f"중복 {len(completion_report['duplicates'])}건. 아래 리포트를 확인하세요.")
+                    render_integrity_report(completion_report, title="3단계 완료 후 검증")
+                elif completion_report["fallback"]:
+                    notify("warning",
+                           f"⚠️ 3단계 완료. 폴백(원문 유지) 섹션 {len(completion_report['fallback'])}건이 있습니다. 재실행으로 재생성을 권장합니다.")
+                else:
+                    notify("success", f"✅ 3단계 검증 통과 (총 {completion_report['cached']}개 섹션, 누락·중복 0건).")
                 # 정상 완료 시 3단계 캐시 정리 (재실행 충돌 방지)
                 clear_progress(st.session_state.project_id, "stage3_body")
                 st.success("🎉 제안서 초안 생성이 완료되었습니다!")
@@ -1428,7 +1542,9 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                 # 부분 본문도 보존: 중단 시점까지의 draft를 저장해 두면 4단계 진입 시 즉시 활용 가능
                 if full_proposal.strip():
                     save_stage_result(st.session_state.project_id, "3단계: 본문 생성", full_proposal.strip(), llm_type)
-                    st.info("중단 시점까지의 부분 초안을 저장했습니다. 다시 '시작'을 누르면 남은 섹션부터 이어서 생성합니다.")
+                    notify("info", "중단 시점까지의 부분 초안을 저장했습니다. 다시 '시작'을 누르면 남은 섹션부터 이어서 생성합니다.")
+        except Exception as _stage3_exc:
+            notify("error", f"🚨 3단계 실행 중 치명적 오류: {_stage3_exc}. 진행분은 DB에 보존되어 재실행 시 자동 재사용됩니다.")
         finally:
             # (P1-3) 어떤 경우에도 is_generating 플래그 해제
             st.session_state.is_generating = False
@@ -1445,6 +1561,29 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
         cols[1].download_button(label="📥 초안 TXT 다운로드", data=display_text.encode('utf-8'), file_name=f"[초안] {st.session_state.finalized_topic}.txt", mime="text/plain", use_container_width=True)
         if st.session_state.get('citations'):
             cols[2].download_button(label="📥 출처 목록 TXT 다운로드", data=st.session_state.citations.encode('utf-8'), file_name=f"[출처] {st.session_state.finalized_topic}.txt", mime="text/plain", use_container_width=True)
+
+        # --- 3단계 재실행 컨트롤 ---
+        st.markdown("---")
+        st.markdown("#### 🔁 3단계 재실행")
+        rr1, rr2 = st.columns(2)
+        with rr1:
+            if st.button("🔁 이어서 재실행 (누락된 섹션만 보강)", use_container_width=True, key="stage3_rerun_resume"):
+                # 누락된 섹션을 기준으로 재실행: draft_proposal과 citations 캐시는 지우되 stage_progress는 보존
+                del st.session_state['draft_proposal']
+                if 'citations' in st.session_state: del st.session_state['citations']
+                st.session_state.is_generating = True
+                st.session_state.generation_stopped = False
+                notify("info", "이어서 재실행을 시작합니다. 처리된 섹션은 재사용되고, 누락분만 새로 생성됩니다.")
+                st.rerun()
+        with rr2:
+            if st.button("🔄 처음부터 재실행 (캐시 전부 삭제)", use_container_width=True, key="stage3_rerun_full", type="secondary"):
+                clear_progress(st.session_state.project_id, "stage3_body")
+                del st.session_state['draft_proposal']
+                if 'citations' in st.session_state: del st.session_state['citations']
+                st.session_state.is_generating = True
+                st.session_state.generation_stopped = False
+                notify("warning", "캐시를 모두 삭제하고 처음부터 재실행합니다.")
+                st.rerun()
 
 elif st.session_state.active_tab == "4단계: 최종 품질 검증":
     st.header("🧐 제안서 최종 품질 검증")
@@ -1554,6 +1693,13 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                 progress_bar, status_text = st.progress(0), st.empty()
                 st.caption(f"최종 검토 실행 중: AI 호출은 {'+'.join(str(t) for t in LLM_RETRY_TIMEOUTS)}초로 최대 {len(LLM_RETRY_TIMEOUTS)}회 재시도 후에만 원문 유지로 넘어갑니다. 처리된 섹션은 즉시 DB에 저장되어 중단되어도 이어서 진행할 수 있습니다.")
                 log_container = st.empty()
+                # 진입 시 진행분 알림
+                _entry_body = get_progress_summary(project_id, "stage4_enhance_body")
+                _entry_toc = get_progress_summary(project_id, "stage4_enhance_toc")
+                if _entry_body or _entry_toc:
+                    notify("info",
+                           f"4단계 진입 — 본문 {(_entry_body or {}).get('count', 0)}건 / "
+                           f"목차 {(_entry_toc or {}).get('count', 0)}건 재사용 예정.")
                 try:
                     final_proposal_text = enhance_proposal(
                         st.session_state.draft_to_enhance,
@@ -1567,10 +1713,24 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                     )
                     st.session_state.final_proposal = final_proposal_text
                     save_stage_result(st.session_state.project_id, "4단계: 최종본", st.session_state.final_proposal)
+                    # 정상 종료 후 폴백/완료 알림
+                    _final_body = get_progress_summary(project_id, "stage4_enhance_body") or {}
+                    _final_toc = get_progress_summary(project_id, "stage4_enhance_toc") or {}
+                    _fallback_total = _final_body.get('fallback_count', 0) + _final_toc.get('fallback_count', 0)
+                    if _fallback_total > 0:
+                        notify("warning",
+                               f"⚠️ 4단계 완료 — 다만 {_fallback_total}개 섹션이 LLM 실패로 원문 유지(폴백)로 처리되었습니다. "
+                               "재실행 버튼으로 폴백 섹션만 재시도할 수 있습니다.")
+                    else:
+                        notify("success", "✅ 4단계 검토 완료. 폴백 없이 모두 성공했습니다.")
                     # 정상 종료 시 진행분은 정리 (재실행 시 불필요한 캐시 방지)
                     clear_progress(project_id, "stage4_enhance_body")
                     clear_progress(project_id, "stage4_enhance_toc")
                     st.session_state.resume_stage4 = False
+                except Exception as _stage4_exc:
+                    notify("error",
+                           f"🚨 4단계 강화 중 치명적 오류: {_stage4_exc}. "
+                           "진행분은 DB에 보존되어 재실행 시 자동 재사용됩니다.")
                 finally:
                     # 예외/리로드 시에도 플래그를 반드시 해제 → LLM 폭주 방지 (P1-3)
                     st.session_state.enhancing = False
@@ -1582,6 +1742,30 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                 st.subheader("개선된 제안서 최종본")
                 display_text = remove_markdown_headings(st.session_state.final_proposal)
                 st.text_area("최종본 내용", value=display_text, height=400)
+
+                # --- 4단계 재실행 컨트롤 ---
+                st.markdown("#### 🔁 4단계 재실행")
+                rr1, rr2 = st.columns(2)
+                with rr1:
+                    if st.button("🔁 이어서 재실행 (캐시 재사용)", use_container_width=True, key="stage4_rerun_resume"):
+                        st.session_state.resume_stage4 = True
+                        st.session_state.enhancing = True
+                        st.session_state.draft_to_enhance = (
+                            st.session_state.get('editable_draft_content') or draft_proposal
+                        )
+                        notify("info", "이어서 재실행합니다. 처리된 섹션은 LLM 재호출 없이 재사용됩니다.")
+                        st.rerun()
+                with rr2:
+                    if st.button("🔄 처음부터 재실행 (캐시 삭제)", use_container_width=True, key="stage4_rerun_full"):
+                        clear_progress(project_id, "stage4_enhance_body")
+                        clear_progress(project_id, "stage4_enhance_toc")
+                        st.session_state.resume_stage4 = False
+                        st.session_state.enhancing = True
+                        st.session_state.draft_to_enhance = (
+                            st.session_state.get('editable_draft_content') or draft_proposal
+                        )
+                        notify("warning", "캐시를 삭제하고 4단계를 처음부터 다시 실행합니다.")
+                        st.rerun()
 
                 reuse_col1, reuse_col2 = st.columns(2)
                 with reuse_col1:

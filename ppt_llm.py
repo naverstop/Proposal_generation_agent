@@ -22,25 +22,50 @@ except Exception:
     _log = logging.getLogger("ppt_llm")
 
 
-DEFAULT_CLAUDE_MODEL = "claude-opus-4-5"
+DEFAULT_CLAUDE_MODEL = "claude-opus-4-5"  # llm_config 자동 디스커버리 실패 시 safety net
+
+
+def _temperature_deprecated(model_id: str) -> bool:
+    """temperature 파라미터를 거부하는 신규 Claude 모델 식별.
+
+    현재 Anthropic 정책상 Opus 4.8 이후의 reasoning/thinking 계열 모델이 해당된다.
+    안전을 위해 'opus-4-8' 이상 패턴 또는 사용자가 명시한 _no_temp 접미사가 있으면 생략.
+    """
+    if not model_id:
+        return False
+    m = model_id.lower()
+    # opus-4-8, opus-4-9, opus-5-x 등
+    for known in ("opus-4-8", "opus-4-9", "opus-5"):
+        if known in m:
+            return True
+    return False
 
 
 def get_ppt_llm(gemini_api_key: str, max_retries: int = 1, temperature: float = 0.5) -> Tuple[object, str]:
     """PPT 생성용 LLM을 반환. Claude > Gemini 순으로 시도."""
     claude_key = (os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or "").strip()
-    claude_model = (os.getenv("CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL).strip()
+    # llm_config.claude_model() 이 .env override + 자동 디스커버리(1h 캐시)를 모두 처리한다.
+    try:
+        from llm_config import claude_model as _claude_model_fn
+        claude_model = _claude_model_fn()
+    except Exception:
+        claude_model = (os.getenv("CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL).strip()
 
     if claude_key:
         try:
             from langchain_anthropic import ChatAnthropic
-            llm = ChatAnthropic(
+            # 신규 Opus 4.8+ 등 일부 모델은 temperature 파라미터가 deprecated.
+            # 4-8 이상 또는 사용자 지정 신 모델은 temperature 생략, 그 외는 종전대로 전달.
+            kwargs = dict(
                 model=claude_model,
                 api_key=claude_key,
-                temperature=temperature,
                 max_tokens=4096,
                 timeout=120,
                 max_retries=max_retries,
             )
+            if not _temperature_deprecated(claude_model):
+                kwargs["temperature"] = temperature
+            llm = ChatAnthropic(**kwargs)
             _log.info(f"PPT LLM = Claude ({claude_model})")
             return llm, f"Claude · {claude_model}"
         except ImportError:

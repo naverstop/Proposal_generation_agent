@@ -106,9 +106,15 @@ def _check_claude() -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def check_all_apis() -> Dict[str, Tuple[str, str]]:
-    """3개 외부 API 상태를 한 번에 점검. 5분 캐시."""
+    """외부 API 상태 점검. 5분 캐시.
+
+    Gemini는 Pro/Flash 모두 동일한 API 키/엔드포인트를 공유하므로 한 번의 ping 결과를
+    두 칩(Pro/Flash)에 공통으로 적용한다.
+    """
+    gemini_state = _check_gemini()
     return {
-        "Gemini": _check_gemini(),
+        "Gemini Pro": gemini_state,
+        "Gemini Flash": gemini_state,
         "Google Search": _check_google_search(),
         "Claude": _check_claude(),
     }
@@ -153,11 +159,24 @@ def _cse_version_label() -> str:
 
 
 def _service_model_map() -> dict:
-    """서비스명 → 현재 연결된 모델 ID(또는 API 버전) 매핑. 정상일 때만 옆에 표시."""
+    """서비스명 → 표시할 모델/버전 라벨. 별칭은 실제 resolve된 버전과 함께 표시."""
     try:
-        from llm_config import gemini_pro_model, gemini_flash_model, claude_model
+        from llm_config import (
+            gemini_pro_model,
+            gemini_flash_model,
+            claude_model,
+            resolve_gemini_version,
+        )
+
+        def _gemini_label(alias: str) -> str:
+            resolved = resolve_gemini_version(alias)
+            if resolved and resolved != alias:
+                return f"{alias} → {resolved}"
+            return alias
+
         return {
-            "Gemini": f"{gemini_pro_model()} / {gemini_flash_model()}",
+            "Gemini Pro": _gemini_label(gemini_pro_model()),
+            "Gemini Flash": _gemini_label(gemini_flash_model()),
             "Claude": claude_model(),
             # Google Custom Search JSON API는 v1만 발행됨 (디스커버리에서 실제 revision 조회)
             "Google Search": _cse_version_label(),

@@ -118,6 +118,54 @@ def invalidate_claude_cache() -> None:
     _CLAUDE_CACHE["ts"] = 0.0
 
 
+# ---------------------------------------------------------------------------
+# Gemini 별칭(latest) → 실제 resolve 버전 조회
+# ---------------------------------------------------------------------------
+# 별칭은 자기 자신만 echo하므로(`gemini-pro-latest` → "Gemini Pro Latest"),
+# `:generateContent` 응답의 `modelVersion` 필드를 캡처해야 실제 버전(예: gemini-3.1-pro-preview)을 얻을 수 있다.
+_GEMINI_RESOLVED_CACHE: dict = {}  # alias -> {"version": str, "ts": float}
+_GEMINI_RESOLVED_TTL = 3600  # 1h
+
+
+def resolve_gemini_version(model_id: str) -> str:
+    """모델 ID가 *-latest 별칭이면 실제 resolve된 버전 ID를 반환, 그렇지 않으면 자기 자신 반환.
+
+    Google Generative Language API는 별칭의 실제 매핑을 메타데이터로 노출하지 않아,
+    1토큰짜리 generateContent 호출로 `modelVersion` 필드를 캡처한다. 1시간 캐시.
+    """
+    if not model_id or "latest" not in model_id:
+        return model_id
+    now = time.time()
+    cached = _GEMINI_RESOLVED_CACHE.get(model_id)
+    if cached and (now - cached["ts"] < _GEMINI_RESOLVED_TTL):
+        return cached["version"]
+
+    api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    if not api_key:
+        return model_id
+    try:
+        import requests
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+        body = {
+            "contents": [{"parts": [{"text": "ping"}]}],
+            "generationConfig": {"maxOutputTokens": 1},
+        }
+        r = requests.post(url, params={"key": api_key}, json=body, timeout=6)
+        if r.status_code != 200:
+            return model_id
+        resolved = (r.json().get("modelVersion") or "").strip() or model_id
+        _GEMINI_RESOLVED_CACHE[model_id] = {"version": resolved, "ts": now}
+        _log.info(f"Gemini alias resolved: {model_id} → {resolved}")
+        return resolved
+    except Exception as e:
+        _log.warning(f"Gemini resolve 실패 ({model_id}): {type(e).__name__}: {e}")
+        return model_id
+
+
+def invalidate_gemini_resolve_cache() -> None:
+    _GEMINI_RESOLVED_CACHE.clear()
+
+
 def get_active_models() -> dict:
     """현재 사용 중인 모델 식별자 (UI 표시·로그용)."""
     return {

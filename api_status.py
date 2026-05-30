@@ -127,32 +127,42 @@ _ICON = {"ok": "🟢", "warn": "🟡", "error": "🔴"}
 _LABEL = {"ok": "정상", "warn": "경고", "error": "오류"}
 
 
-def _active_models_html() -> str:
-    """현재 .env 설정에 따른 활성 모델명을 작은 칩으로 표시."""
+def _service_model_map() -> dict:
+    """서비스명 → 현재 연결된 모델 ID 매핑. 정상일 때만 옆에 표시."""
     try:
-        from llm_config import get_active_models
-        models = get_active_models()
+        from llm_config import gemini_pro_model, gemini_flash_model, claude_model
+        return {
+            "Gemini": f"{gemini_pro_model()} / {gemini_flash_model()}",
+            "Claude": claude_model(),
+            # Google Search는 검색 API라 모델 개념 없음 (CSE v1 고정)
+            "Google Search": "Custom Search v1",
+        }
     except Exception:
-        return ""
-    chips = "".join(
-        f'<span class="appx-model-chip"><b>{name}</b> · {model}</span>'
-        for name, model in models.items()
-    )
-    return f'<div class="appx-model-bar">{chips}</div>'
+        return {}
 
 
 def render_api_status_bar() -> None:
-    """페이지 상단 API 상태 바. 오류·경고가 있으면 추가 알림 배너도 출력."""
-    statuses = check_all_apis()
+    """페이지 상단 API 상태 바. 오류·경고가 있으면 추가 알림 배너도 출력.
 
-    # 1) 칩 형태 상태바
+    각 서비스 칩에는 상태(🟢/🟡/🔴) + 서비스명 + 상태 메시지 + 현재 연결된 모델 버전을 함께 표시.
+    """
+    statuses = check_all_apis()
+    models = _service_model_map()
+
     pills = []
     for svc, (state, msg) in statuses.items():
+        model_id = models.get(svc, "")
+        # 정상(ok) 상태일 때만 모델 버전을 강조 표시. 오류/경고 시는 메시지에 집중.
+        model_html = (
+            f'<span class="appx-api-model" title="현재 연결된 모델/버전">⚙ {model_id}</span>'
+            if (state == "ok" and model_id) else ""
+        )
         pills.append(
             f'<span class="appx-api-pill appx-api-{state}">'
             f'<span class="appx-api-dot">{_ICON.get(state, "⚪")}</span>'
             f'<span class="appx-api-name">{svc}</span>'
             f'<span class="appx-api-msg">{msg}</span>'
+            f'{model_html}'
             f'</span>'
         )
     bar_html = (
@@ -160,7 +170,6 @@ def render_api_status_bar() -> None:
         '<span class="appx-api-bar-title">외부 API 상태</span>'
         f'{"".join(pills)}'
         '</div>'
-        f'{_active_models_html()}'
     )
     st.markdown(bar_html, unsafe_allow_html=True)
 

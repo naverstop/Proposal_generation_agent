@@ -350,7 +350,17 @@ div[data-testid="stDataFrame"] {
 .appx-api-error { background: var(--appx-danger-soft); border-color: var(--appx-danger); }
 .appx-api-error .appx-api-msg { color: var(--appx-danger); font-weight: 700; }
 
-/* Active model chips (under API bar) */
+/* Inline model/version chip shown inside API pill (next to status) */
+.appx-api-model {
+    display: inline-flex; align-items: center;
+    margin-left: 6px; padding: 1px 8px;
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.01em;
+    color: #FFFFFF; background: var(--appx-success);
+    border-radius: 999px; border: 1px solid var(--appx-success);
+    white-space: nowrap;
+}
+
+/* Active model chips (deprecated standalone bar, kept for backward compat) */
 .appx-model-bar {
     display: flex; flex-wrap: wrap; gap: 6px;
     margin: -8px 0 14px 0;

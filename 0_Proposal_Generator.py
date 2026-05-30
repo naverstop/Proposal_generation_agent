@@ -52,9 +52,20 @@ st.title("🤖 AI 제안서/PPT 자동 생성기 (v4.4 Final)")
 # --- 2. 데이터베이스 관리 함수 ---
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.db")
 
+def _connect_db():
+    """모든 DB 호출에서 공통으로 사용할 커넥션 (락 대기·자동 커밋·UTF-8 친화)."""
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    return conn
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = _connect_db()
     c = conn.cursor()
+    # WAL 모드: 강화 작업 중 History 페이지 등 동시 조회 시 락 충돌을 줄인다.
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     c.execute('''
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,8 +89,91 @@ def init_db():
             UNIQUE(project_id, stage_name)
         )
     ''')
+    # 중단 시점 재사용을 위한 섹션 단위 진행분 저장 테이블 (P1-2)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS stage_progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            stage TEXT NOT NULL,          -- 'stage3_body' | 'stage4_enhance_body' | 'stage4_enhance_toc'
+            section_key TEXT NOT NULL,    -- original_line 또는 heading 문자열
+            payload TEXT,                 -- 처리 결과 본문/제목
+            status TEXT,                  -- 'ok' | 'fallback_original' | 'skipped'
+            attempt INTEGER DEFAULT 1,
+            elapsed_sec REAL DEFAULT 0,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(project_id, stage, section_key)
+        )
+    ''')
     conn.commit()
     conn.close()
+
+
+# --- 진행분(중간 산출물) 영속화 헬퍼 ---
+def save_progress_item(project_id, stage, section_key, payload, status="ok", attempt=1, elapsed_sec=0.0):
+    """섹션 1개 처리 직후 즉시 저장. 같은 키면 덮어쓰기."""
+    if not project_id:
+        return
+    try:
+        conn = _connect_db()
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO stage_progress (project_id, stage, section_key, payload, status, attempt, elapsed_sec, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(project_id, stage, section_key) DO UPDATE SET
+                payload=excluded.payload,
+                status=excluded.status,
+                attempt=excluded.attempt,
+                elapsed_sec=excluded.elapsed_sec,
+                updated_at=CURRENT_TIMESTAMP
+        ''', (project_id, stage, section_key, payload, status, attempt, elapsed_sec))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        # 영속화 실패가 작업 자체를 막지 않게 한다.
+        print(f"[stage_progress 저장 실패] {e}")
+
+def load_progress_map(project_id, stage):
+    """{section_key: (payload, status)} 형태로 반환."""
+    if not project_id:
+        return {}
+    try:
+        conn = _connect_db()
+        c = conn.cursor()
+        c.execute('''
+            SELECT section_key, payload, status, updated_at
+            FROM stage_progress
+            WHERE project_id = ? AND stage = ?
+        ''', (project_id, stage))
+        rows = c.fetchall()
+        conn.close()
+        return {r[0]: {"payload": r[1], "status": r[2], "updated_at": r[3]} for r in rows}
+    except Exception as e:
+        print(f"[stage_progress 조회 실패] {e}")
+        return {}
+
+def clear_progress(project_id, stage=None):
+    """특정 stage 또는 프로젝트 전체 진행분 삭제."""
+    if not project_id:
+        return
+    try:
+        conn = _connect_db()
+        c = conn.cursor()
+        if stage:
+            c.execute("DELETE FROM stage_progress WHERE project_id = ? AND stage = ?", (project_id, stage))
+        else:
+            c.execute("DELETE FROM stage_progress WHERE project_id = ?", (project_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[stage_progress 삭제 실패] {e}")
+
+def get_progress_summary(project_id, stage):
+    """재개 카드 UI에 표시할 요약 정보."""
+    items = load_progress_map(project_id, stage)
+    if not items:
+        return None
+    latest = max((v.get("updated_at") or "") for v in items.values())
+    return {"count": len(items), "latest": latest}
 
 def create_new_project():
     conn = sqlite3.connect(DB_FILE)
@@ -292,8 +386,8 @@ def generate_toc(topic, documents):
     chain = prompt | llm | StrOutputParser()
     return chain.stream({"topic": topic, "context": full_text[:10000]})
 
-def generate_section_content_openai(section, topic, toc, documents, page_count, total_sections):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.6, google_api_key=gemini_api_key)
+def generate_section_content_openai(section, topic, toc, documents, page_count, total_sections, attempt_timeout=LLM_TIMEOUT_SECONDS):
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.6, google_api_key=gemini_api_key, timeout=attempt_timeout)
     full_text = "\n\n".join([doc.page_content for doc in documents]) if documents else "제공된 참고 자료 없음"
     section_pages = max(page_count / total_sections, 1)
     section_words = int(section_pages * 500)
@@ -322,10 +416,10 @@ def generate_section_content_openai(section, topic, toc, documents, page_count, 
         "min_words": min_words
     })
 
-def generate_section_with_citations(section, topic, toc, documents, search_tool, status_text, page_count, total_sections):
+def generate_section_with_citations(section, topic, toc, documents, search_tool, status_text, page_count, total_sections, attempt_timeout=LLM_TIMEOUT_SECONDS):
     if not (google_api_key and google_cse_id):
         st.warning("Google API 키 또는 검색엔진 ID가 없어 출처 표기 기능을 사용할 수 없습니다. 일반 모드로 생성합니다.")
-        return generate_section_content_openai(section, topic, toc, documents, page_count, total_sections), ""
+        return generate_section_content_openai(section, topic, toc, documents, page_count, total_sections, attempt_timeout=attempt_timeout), ""
 
     uploaded_context = "\n\n".join([doc.page_content for doc in documents]) if documents else "제공된 참고 자료 없음"
     status_text.text(f"🔄 ({st.session_state.current_section_index + 1}/{st.session_state.total_sections}) '{section}' 근거 자료 검색 중 (법령, 논문, 뉴스)...")
@@ -353,14 +447,14 @@ def generate_section_with_citations(section, topic, toc, documents, search_tool,
     unique_results = {res['link']: res for res in search_results}.values()
     if not unique_results:
         status_text.text(f"🔄 ({st.session_state.current_section_index + 1}/{st.session_state.total_sections}) '{section}' 관련 웹 자료 없음. 내용 생성 중...")
-        return generate_section_content_openai(section, topic, toc, documents, page_count, total_sections), ""
+        return generate_section_content_openai(section, topic, toc, documents, page_count, total_sections, attempt_timeout=attempt_timeout), ""
     
     retrieved_context = ""
     for i, res in enumerate(unique_results):
         retrieved_context += f"### 검색자료_{i+1}\n- 제목: {res.get('title', 'N/A')}\n- 링크: {res.get('link', 'N/A')}\n- 요약: {res.get('snippet', 'N/A')}\n\n"
 
     status_text.text(f"🔄 ({st.session_state.current_section_index + 1}/{st.session_state.total_sections}) '{section}' 자료 분석 및 내용 생성 중...")
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.6, google_api_key=gemini_api_key)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.6, google_api_key=gemini_api_key, timeout=attempt_timeout)
     prompt = PromptTemplate.from_template(
         "당신은 최고 수준의 전문 리서처이자 제안서 작성 전문가입니다. 당신의 임무는 '{section}'에 대한 논점을 제시하고, 검색된 자료를 바탕으로 그 논점을 뒷받침하는 근거를 제시하는 것입니다.\n\n"
         "**[작업 절차 및 규칙]**\n"
@@ -415,6 +509,12 @@ def append_enhancement_log(log_container, logs, message):
     log_container.text("실행 로그\n" + "\n".join(visible_logs))
 
 def execute_with_timeout(task, *args, timeout_seconds=LLM_TIMEOUT_SECONDS, on_tick=None, **kwargs):
+    """
+    task를 별도 스레드에서 실행하고 timeout_seconds 내에 결과를 수립한다.
+    task에 attempt_timeout이라는 keyword를 주입해 LLM SDK의 자체 timeout도 같이 걸도록 한다.
+    """
+    if "attempt_timeout" not in kwargs:
+        kwargs["attempt_timeout"] = timeout_seconds
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(task, *args, **kwargs)
     start_time = time.monotonic()
@@ -452,15 +552,19 @@ def execute_with_retries(task, *args, timeouts=None, on_attempt=None, on_wait=No
         except TimeoutError as exc:
             last_error = exc
             continue
+        except Exception as exc:
+            # SDK 내부 에러(네트워크·쿠타·JSON 오류 등)도 동일하게 재시도
+            last_error = exc
+            continue
 
     raise last_error if last_error else TimeoutError("재시도 정책이 비어 있습니다.")
 
-def call_llm_api_for_body_processing(prompt_text):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.5, google_api_key=gemini_api_key, timeout=LLM_TIMEOUT_SECONDS)
+def call_llm_api_for_body_processing(prompt_text, attempt_timeout=LLM_TIMEOUT_SECONDS):
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.5, google_api_key=gemini_api_key, timeout=attempt_timeout)
     return llm.invoke(prompt_text).content
 
-def call_llm_api_for_toc_suggestion(prompt_text):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.4, google_api_key=gemini_api_key, timeout=LLM_TIMEOUT_SECONDS)
+def call_llm_api_for_toc_suggestion(prompt_text, attempt_timeout=LLM_TIMEOUT_SECONDS):
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.4, google_api_key=gemini_api_key, timeout=attempt_timeout)
     response_str = llm.invoke(prompt_text).content.strip()
     try:
         if response_str.startswith("```json"):
@@ -603,7 +707,9 @@ def suggest_refined_toc_title(item, full_content, on_wait=None, on_attempt=None)
 
     return item['text'], "목차 강화 응답이 비어 기존 제목 유지"
 
-def refine_table_of_contents(toc_structure, body_map, on_item_start=None, on_item_wait=None, on_item_done=None, on_item_attempt=None):
+def refine_table_of_contents(toc_structure, body_map, on_item_start=None, on_item_wait=None, on_item_done=None, on_item_attempt=None, cached_titles=None):
+    """cached_titles: {original_line: 강화된 제목} - 이전 진행분 재사용."""
+    cached_titles = cached_titles or {}
     refined_toc = []
     numbered_items = [item for item in toc_structure if item.get("number")]
     total_numbered_items = len(numbered_items)
@@ -619,6 +725,16 @@ def refine_table_of_contents(toc_structure, body_map, on_item_start=None, on_ite
             on_item_start(processed_numbered_items, total_numbered_items, item)
 
         refined_item = item.copy()
+
+        # --- (P1-2) 캐시된 강화 결과가 있으면 LLM 호출 생략 ---
+        cached_title = cached_titles.get(item["original_line"])
+        if cached_title:
+            refined_item["text"] = cached_title
+            if on_item_done:
+                on_item_done(processed_numbered_items, total_numbered_items, refined_item, "이전 진행분 재사용")
+            refined_toc.append(refined_item)
+            continue
+
         child_content_parts = [body_map.get(item["original_line"], "")]
         for next_item in toc_structure[i+1:]:
             if next_item["level"] > item["level"]:
@@ -697,9 +813,9 @@ def reassemble_proposal_string(toc_structure, processed_sections):
 
     return "\n\n".join(final_content_parts)
 
-def enhance_proposal(draft_text, review_criteria, page_count, status_text, progress_bar, log_container):
+def enhance_proposal(draft_text, review_criteria, page_count, status_text, progress_bar, log_container, project_id=None, resume=True):
+    logs = []
     try:
-        logs = []
         update_live_progress(status_text, progress_bar, "[1/4] 문서 구조 분석 중", 0.03)
         append_enhancement_log(log_container, logs, "최종 검토를 시작했습니다.")
         original_toc, body_map = parse_proposal_string(draft_text)
@@ -707,6 +823,15 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
         total_body_sections = len(body_map)
         numbered_toc_sections = len([item for item in original_toc if item.get("number")])
         append_enhancement_log(log_container, logs, f"분석 완료: 본문 {total_body_sections}개, 목차 {numbered_toc_sections}개 항목을 처리합니다.")
+
+        # --- (P1-2) 이전 진행분 로드 ---
+        body_progress = load_progress_map(project_id, "stage4_enhance_body") if resume else {}
+        toc_progress = load_progress_map(project_id, "stage4_enhance_toc") if resume else {}
+        if body_progress or toc_progress:
+            append_enhancement_log(
+                log_container, logs,
+                f"이전 진행분 발견: 본문 {len(body_progress)}/{total_body_sections}건, 목차 {len(toc_progress)}/{numbered_toc_sections}건 → 이어서 진행합니다.",
+            )
 
         update_live_progress(status_text, progress_bar, "[2/4] 본문 내용 개선 준비 중", 0.05)
         processed_body_map = {}
@@ -719,9 +844,25 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
             body_start = 0.05 + (i / max(total_body_sections, 1)) * 0.65
             body_end = 0.05 + ((i + 1) / max(total_body_sections, 1)) * 0.65
 
+            # --- (P1-2) 이미 처리한 섹션은 DB 결과 재사용 ---
+            cached = body_progress.get(original_line)
+            if cached and cached.get("payload") is not None:
+                processed_body_map[original_line] = cached["payload"]
+                update_live_progress(
+                    status_text, progress_bar,
+                    f"[2/4] 본문 재사용 {i+1}/{total_body_sections}: '{title_text}' (이전 결과)",
+                    body_end,
+                )
+                append_enhancement_log(
+                    log_container, logs,
+                    f"본문 {i+1}/{total_body_sections} 재사용: '{title_text}' (status={cached.get('status')})",
+                )
+                continue
+
             update_live_progress(status_text, progress_bar, f"[2/4] 본문 개선 중 {i+1}/{total_body_sections}: '{title_text}'", body_start)
             append_enhancement_log(log_container, logs, f"본문 {i+1}/{total_body_sections} 시작: '{title_text}'")
 
+            section_start_ts = time.monotonic()
             improved_content, warning_message = process_body_section(
                 content,
                 review_criteria,
@@ -740,16 +881,45 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
                         f"본문 {current_index}/{total_items} '{current_title}' 시도 {attempt_index}/{total_attempts} 시작 ({attempt_timeout}초 제한)",
                     ),
             )
+            elapsed_sec = time.monotonic() - section_start_ts
             processed_body_map[original_line] = improved_content
+
+            # --- (P1-2) 섹션 1개 끝나는 즉시 DB에 저장 → 중단되어도 다음 번에 재사용 ---
+            section_status = "fallback_original" if warning_message else "ok"
+            save_progress_item(
+                project_id, "stage4_enhance_body", original_line,
+                improved_content, status=section_status, elapsed_sec=elapsed_sec,
+            )
+
             update_live_progress(status_text, progress_bar, f"[2/4] 본문 개선 완료 {i+1}/{total_body_sections}: '{title_text}'", body_end)
             append_enhancement_log(
                 log_container,
                 logs,
-                warning_message or f"본문 {i+1}/{total_body_sections} 완료: '{title_text}'",
+                warning_message or f"본문 {i+1}/{total_body_sections} 완료: '{title_text}' ({elapsed_sec:.1f}초)",
             )
 
         update_live_progress(status_text, progress_bar, "[3/4] 목차 구조 강화 준비 중", 0.70)
         append_enhancement_log(log_container, logs, "목차 강화 단계를 시작합니다.")
+
+        # --- (P1-2) 목차 강화도 캐시 활용 + 결과 영속화 ---
+        def _on_toc_done(current_index, total_items, item, warning_message):
+            update_live_progress(
+                status_text, progress_bar,
+                f"[3/4] 목차 강화 완료 {current_index}/{total_items}: '{item['text']}'",
+                0.70 + (current_index / max(total_items, 1)) * 0.25,
+            )
+            append_enhancement_log(
+                log_container, logs,
+                warning_message or f"목차 {current_index}/{total_items} 완료: '{item['text']}'",
+            )
+            try:
+                save_progress_item(
+                    project_id, "stage4_enhance_toc", item.get("original_line", item['text']),
+                    item['text'], status="fallback_original" if warning_message else "ok",
+                )
+            except Exception:
+                pass
+
         refined_toc = refine_table_of_contents(
             original_toc,
             processed_body_map,
@@ -776,26 +946,14 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
                     logs,
                     f"목차 {current_index}/{total_items} '{item['text']}' 시도 {attempt_index}/{total_attempts} 시작 ({attempt_timeout}초 제한)",
                 ),
-            on_item_done=lambda current_index, total_items, item, warning_message:
-                (
-                    update_live_progress(
-                        status_text,
-                        progress_bar,
-                        f"[3/4] 목차 강화 완료 {current_index}/{total_items}: '{item['text']}'",
-                        0.70 + (current_index / max(total_items, 1)) * 0.25,
-                    ),
-                    append_enhancement_log(
-                        log_container,
-                        logs,
-                        warning_message or f"목차 {current_index}/{total_items} 완료: '{item['text']}'",
-                    )
-                ),
+            on_item_done=_on_toc_done,
+            cached_titles={k: v.get("payload") for k, v in toc_progress.items() if v.get("payload")},
         )
-        
+
         update_live_progress(status_text, progress_bar, "[4/4] 최종 문서 생성 중", 0.95)
         append_enhancement_log(log_container, logs, "최종 문서를 조립합니다.")
         final_text = reassemble_proposal_string(refined_toc, processed_body_map)
-        
+
         update_live_progress(status_text, progress_bar, "[4/4] 저장 및 마무리 중", 0.99)
         append_enhancement_log(log_container, logs, "최종 문서 생성이 완료되었습니다.")
         progress_bar.progress(1.0)
@@ -804,11 +962,12 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
     except Exception as e:
         import traceback
         st.error(f"오류: 제안서 개선 작업 중 문제가 발생했습니다. - {e}")
+        append_enhancement_log(log_container, logs, f"❌ 예외 발생: {e}. 지금까지의 진행분은 DB에 저장되어 재진입 시 이어서 처리됩니다.")
         traceback.print_exc()
         return draft_text
 
-def generate_overview_section(full_proposal_text, topic):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.5, google_api_key=gemini_api_key)
+def generate_overview_section(full_proposal_text, topic, attempt_timeout=LLM_TIMEOUT_SECONDS):
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.5, google_api_key=gemini_api_key, timeout=attempt_timeout)
     text_to_summarize = full_proposal_text.replace("[사업 개요는 최종본 생성 시 자동으로 채워집니다.]", "").strip()
     if "## 목차" in text_to_summarize:
         text_to_summarize = text_to_summarize.split("## 목차", 1)[1]
@@ -939,6 +1098,14 @@ if 'selected_project_id' in st.session_state and 'project_loaded' not in st.sess
 if 'Google Search' not in st.session_state: st.session_state['Google Search'] = get_search_tool()
 if 'active_tab' not in st.session_state: st.session_state.active_tab = "1단계: 제안서 시작"
 if 'generation_stopped' not in st.session_state: st.session_state.generation_stopped = False
+
+# (P1-3) 부팅 시 enhancing 플래그가 남아 있으면 강제로 내린다.
+# Streamlit 리로드/세션 재진입 시 LLM 자동 재호출 폭주를 막는다.
+if st.session_state.get('enhancing'):
+    st.session_state.enhancing = False
+    st.warning("이전 강화 작업이 비정상 종료된 것으로 보여 자동 실행을 중지했습니다. '🔁 재실행' 버튼으로 다시 시작하면 이전 진행분을 재사용합니다.")
+if st.session_state.get('is_generating'):
+    st.session_state.is_generating = False
 
 st.markdown("""<style>
     body { font-family: ' Pretendard', sans-serif; }
@@ -1104,12 +1271,27 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
     st.markdown("---")
 
     if st.session_state.get('is_generating'):
-        if st.button("🛑 생성 중단하기", use_container_width=True, type="primary"):
+        if st.button("🛑 생성 중단하기 (현재 섹션 종료 후 정지)", use_container_width=True, type="primary"):
             st.session_state.generation_stopped = True
             st.session_state.is_generating = False
-            st.warning("생성을 중단했습니다. '다시 시작하기' 버튼을 눌러 처음부터 다시 생성할 수 있습니다.")
+            st.warning("정지 요청 접수: 진행 중인 섹션이 끝나면 정지합니다. 이미 생성된 섹션은 DB에 저장되어 다음 실행 시 자동으로 재사용됩니다.")
             st.rerun()
     elif 'draft_proposal' not in st.session_state:
+        # --- (P1-4) 3단계 진행분 재사용 카드 ---
+        stage3_summary = get_progress_summary(st.session_state.project_id, "stage3_body")
+        if stage3_summary:
+            st.warning(
+                f"이전에 생성하다 중단된 본문이 {stage3_summary['count']}개 남아 있습니다 (마지막 {stage3_summary['latest']}). "
+                "다시 시작하면 처리된 섹션은 LLM 재호출 없이 재사용됩니다."
+            )
+            rs1, rs2 = st.columns(2)
+            with rs1:
+                st.caption("▶ '제안서 생성 시작'을 누르면 자동으로 이어서 진행됩니다.")
+            with rs2:
+                if st.button("🗑 이전 진행분 비우고 처음부터", use_container_width=True, key="reset_stage3_progress"):
+                    clear_progress(st.session_state.project_id, "stage3_body")
+                    st.success("이전 진행분을 비웠습니다.")
+                    st.rerun()
         if st.button("🚀 제안서 생성 시작하기", use_container_width=True):
             if 'draft_proposal' in st.session_state: del st.session_state['draft_proposal']
             if 'citations' in st.session_state: del st.session_state['citations']
@@ -1131,73 +1313,125 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
 
         all_headings = [line.strip() for line in final_toc.split('\n') if line.strip() and not line.strip().startswith('#')]
         st.session_state.total_sections = len(all_headings)
-        
+
+        # --- (P1-4) 3단계 진행분 캐시 로드 ---
+        stage3_cache = load_progress_map(st.session_state.project_id, "stage3_body")
+
         st.markdown("### 제안서 생성 진행률")
         progress_bar, status_text = st.progress(0), st.empty()
         full_proposal, all_citations = f"# {final_topic}\n\n", ""
         if final_toc: full_proposal += f"## 목차\n{final_toc}\n\n"
+        llm_type = "OpenAI"
 
-        for i, current_heading in enumerate(all_headings):
-            st.session_state.current_section_index = i
-            if st.session_state.get('generation_stopped'): status_text.warning("사용자에 의해 생성이 중단되었습니다."); break
-            progress_bar.progress((i + 1) / st.session_state.total_sections)
-            
-            is_leaf_node = True
-            current_level_match = re.match(r'^(\d+(\.\d+)*)', current_heading)
-            if current_level_match and i + 1 < len(all_headings):
-                next_heading = all_headings[i+1]
-                next_level_match = re.match(r'^(\d+(\.\d+)*)', next_heading)
-                if next_level_match and next_level_match.group(1).startswith(current_level_match.group(1) + '.'):
-                    is_leaf_node = False
-            
-            number_match = re.match(r'^(\d+(?:\.\d+)*\.?)', current_heading)
-            if number_match:
-                heading_level = get_heading_level_from_number(number_match.group(1))
+        try:
+            for i, current_heading in enumerate(all_headings):
+                st.session_state.current_section_index = i
+                if st.session_state.get('generation_stopped'):
+                    status_text.warning("사용자 요청으로 정지합니다. 지금까지 처리된 섹션은 DB에 저장되어 다음 실행 시 재사용됩니다.")
+                    break
+                progress_bar.progress((i + 1) / st.session_state.total_sections)
+
+                is_leaf_node = True
+                current_level_match = re.match(r'^(\d+(\.\d+)*)', current_heading)
+                if current_level_match and i + 1 < len(all_headings):
+                    next_heading = all_headings[i+1]
+                    next_level_match = re.match(r'^(\d+(\.\d+)*)', next_heading)
+                    if next_level_match and next_level_match.group(1).startswith(current_level_match.group(1) + '.'):
+                        is_leaf_node = False
+
+                number_match = re.match(r'^(\d+(?:\.\d+)*\.?)', current_heading)
+                if number_match:
+                    heading_level = get_heading_level_from_number(number_match.group(1))
+                else:
+                    heading_level = 1
+                full_proposal += f"{'#' * heading_level} {current_heading}\n\n"
+
+                if i == 0 and ("사업 개요" in current_heading or "사업 목적" in current_heading):
+                    status_text.text(f"➡️ ({i+1}/{st.session_state.total_sections}) '{current_heading}'는 4단계에서 자동 생성됩니다.")
+                    full_proposal += "[사업 개요는 최종본 생성 시 자동으로 채워집니다.]\n\n"
+                    continue
+
+                if is_leaf_node:
+                    cached_item = stage3_cache.get(current_heading)
+                    if cached_item and cached_item.get("payload"):
+                        status_text.text(f"♻️ ({i+1}/{st.session_state.total_sections}) '{current_heading}' 이전 결과 재사용")
+                        full_proposal += f"{cached_item['payload']}\n\n"
+                        continue
+
+                    status_text.text(f"🔄 ({i+1}/{st.session_state.total_sections}) '{current_heading}' 섹션 본문 생성 중... (재시도 정책 {'+'.join(str(t) for t in LLM_RETRY_TIMEOUTS)}초)")
+                    generated_content, citations_for_section = "", ""
+                    section_start_ts = time.monotonic()
+                    try:
+                        if use_citations:
+                            llm_type = "OpenAI_with_Search"
+                            def _task_with_citations(attempt_timeout=LLM_TIMEOUT_SECONDS, **_kw):
+                                return generate_section_with_citations(
+                                    current_heading, final_topic, final_toc,
+                                    st.session_state.get('docs', []), st.session_state['Google Search'],
+                                    status_text, page_count, len(all_headings),
+                                    attempt_timeout=attempt_timeout,
+                                )
+                            generated_content, citations_for_section = execute_with_retries(
+                                _task_with_citations, timeouts=LLM_RETRY_TIMEOUTS,
+                            )
+                        else:
+                            def _task_no_citations(attempt_timeout=LLM_TIMEOUT_SECONDS, **_kw):
+                                return generate_section_content_openai(
+                                    current_heading, final_topic, final_toc,
+                                    st.session_state.get('docs', []), page_count, len(all_headings),
+                                    attempt_timeout=attempt_timeout,
+                                )
+                            generated_content = execute_with_retries(
+                                _task_no_citations, timeouts=LLM_RETRY_TIMEOUTS,
+                            )
+                    except TimeoutError:
+                        total_budget = sum(LLM_RETRY_TIMEOUTS)
+                        st.warning(f"⚠️ '{current_heading}' 생성이 {len(LLM_RETRY_TIMEOUTS)}회 재시도(총 {total_budget}초) 안에 끝나지 않아 빈 본문으로 진행합니다.")
+                        generated_content = f"[자동 생성 실패: 시간 초과 - '{current_heading}']"
+                    except Exception as e:
+                        st.error(f"'{current_heading}' 섹션 생성 중 오류 발생: {e}")
+                        generated_content = f"[오류: '{current_heading}' 생성 실패 - {e}]"
+
+                    cleaned_section_title = re.sub(r"^\d+(\.\d+)*\s*", "", current_heading).strip()
+                    temp_content = generated_content.strip()
+                    if temp_content.startswith(current_heading):
+                        generated_content = temp_content[len(current_heading):].strip()
+                    elif temp_content.startswith(cleaned_section_title):
+                        generated_content = temp_content[len(cleaned_section_title):].strip()
+
+                    full_proposal += f"{generated_content}\n\n"
+                    if citations_for_section: all_citations += f"### {current_heading}\n{citations_for_section}\n\n"
+
+                    # --- (P1-4) 섹션 1개 완료 즉시 DB에 저장 ---
+                    elapsed_sec = time.monotonic() - section_start_ts
+                    save_progress_item(
+                        st.session_state.project_id, "stage3_body", current_heading,
+                        generated_content,
+                        status="ok" if not generated_content.startswith("[") else "fallback_original",
+                        elapsed_sec=elapsed_sec,
+                    )
+
+                else:
+                    status_text.text(f"➡️ ({i+1}/{st.session_state.total_sections}) '{current_heading}' 상위 목차 추가 (본문 생성 건너뜀)")
+                    full_proposal += "\n"
+
+            if not st.session_state.get('generation_stopped'):
+                st.session_state.draft_proposal = full_proposal.strip()
+                save_stage_result(st.session_state.project_id, "3단계: 본문 생성", st.session_state.draft_proposal, llm_type)
+                if all_citations:
+                    st.session_state.citations = all_citations.strip()
+                    save_stage_result(st.session_state.project_id, "3단계: 출처 목록", st.session_state.citations)
+                # 정상 완료 시 3단계 캐시 정리 (재실행 충돌 방지)
+                clear_progress(st.session_state.project_id, "stage3_body")
+                st.success("🎉 제안서 초안 생성이 완료되었습니다!")
             else:
-                heading_level = 1
-            full_proposal += f"{'#' * heading_level} {current_heading}\n\n"
-            
-            if i == 0 and ("사업 개요" in current_heading or "사업 목적" in current_heading):
-                status_text.text(f"➡️ ({i+1}/{st.session_state.total_sections}) '{current_heading}'는 4단계에서 자동 생성됩니다.")
-                full_proposal += "[사업 개요는 최종본 생성 시 자동으로 채워집니다.]\n\n"
-                continue
-
-            if is_leaf_node:
-                status_text.text(f"🔄 ({i+1}/{st.session_state.total_sections}) '{current_heading}' 섹션 본문 생성 중...")
-                generated_content, citations_for_section = "", ""
-                llm_type = "OpenAI"
-                try:
-                    if use_citations:
-                        llm_type = "OpenAI_with_Search"
-                        generated_content, citations_for_section = generate_section_with_citations(current_heading, final_topic, final_toc, st.session_state.get('docs', []), st.session_state['Google Search'], status_text, page_count, len(all_headings))
-                    else:
-                        generated_content = generate_section_content_openai(current_heading, final_topic, final_toc, st.session_state.get('docs', []), page_count, len(all_headings))
-                except Exception as e:
-                    st.error(f"'{current_heading}' 섹션 생성 중 오류 발생: {e}")
-                    generated_content = f"오류: '{current_heading}' 생성에 실패했습니다."
-                
-                cleaned_section_title = re.sub(r"^\d+(\.\d+)*\s*", "", current_heading).strip()
-                temp_content = generated_content.strip()
-                if temp_content.startswith(current_heading):
-                    generated_content = temp_content[len(current_heading):].strip()
-                elif temp_content.startswith(cleaned_section_title):
-                    generated_content = temp_content[len(cleaned_section_title):].strip()
-
-                full_proposal += f"{generated_content}\n\n"
-                if citations_for_section: all_citations += f"### {current_heading}\n{citations_for_section}\n\n"
-
-            else:
-                status_text.text(f"➡️ ({i+1}/{st.session_state.total_sections}) '{current_heading}' 상위 목차 추가 (본문 생성 건너뜀)")
-                full_proposal += "\n"
-
-        if not st.session_state.get('generation_stopped'):
-            st.session_state.draft_proposal = full_proposal.strip()
-            save_stage_result(st.session_state.project_id, "3단계: 본문 생성", st.session_state.draft_proposal, llm_type)
-            if all_citations: 
-                st.session_state.citations = all_citations.strip()
-                save_stage_result(st.session_state.project_id, "3단계: 출처 목록", st.session_state.citations)
-            st.success("🎉 제안서 초안 생성이 완료되었습니다!")
-        st.session_state.is_generating = False
+                # 부분 본문도 보존: 중단 시점까지의 draft를 저장해 두면 4단계 진입 시 즉시 활용 가능
+                if full_proposal.strip():
+                    save_stage_result(st.session_state.project_id, "3단계: 본문 생성", full_proposal.strip(), llm_type)
+                    st.info("중단 시점까지의 부분 초안을 저장했습니다. 다시 '시작'을 누르면 남은 섹션부터 이어서 생성합니다.")
+        finally:
+            # (P1-3) 어떤 경우에도 is_generating 플래그 해제
+            st.session_state.is_generating = False
         st.rerun()
 
     if 'draft_proposal' in st.session_state:
@@ -1220,6 +1454,30 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
         draft_proposal = stages.get('3단계: 본문 생성')
         if project_data and draft_proposal:
             st.info(f"**검토 대상:** {project_data['topic']} (ID: {project_id})")
+            # --- (P1-2) 이전 진행분 재사용 카드 ---
+            body_progress_summary = get_progress_summary(project_id, "stage4_enhance_body")
+            toc_progress_summary = get_progress_summary(project_id, "stage4_enhance_toc")
+            if (body_progress_summary or toc_progress_summary) and not st.session_state.get('enhancing'):
+                with st.container():
+                    st.warning(
+                        "이전에 진행하다 중단된 강화 작업이 남아 있습니다. 이어서 진행하면 처리된 섹션은 LLM 재호출 없이 그대로 사용합니다.\n"
+                        f"- 본문: {body_progress_summary['count'] if body_progress_summary else 0}건 (마지막 {body_progress_summary['latest'] if body_progress_summary else '-'})\n"
+                        f"- 목차: {toc_progress_summary['count'] if toc_progress_summary else 0}건 (마지막 {toc_progress_summary['latest'] if toc_progress_summary else '-'})"
+                    )
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        if st.button("▶ 이어서 진행 (이전 결과 재사용)", use_container_width=True, key="resume_stage4"):
+                            st.session_state.resume_stage4 = True
+                            st.success("다음 강화 실행 시 이전 진행분을 자동으로 이어서 사용합니다.")
+                    with rc2:
+                        if st.button("🗑 진행분 비우고 처음부터", use_container_width=True, key="reset_stage4_progress"):
+                            clear_progress(project_id, "stage4_enhance_body")
+                            clear_progress(project_id, "stage4_enhance_toc")
+                            st.session_state.resume_stage4 = False
+                            st.success("이전 진행분을 모두 비웠습니다.")
+                            st.rerun()
+                    st.markdown("---")
+
             if 'draft_loaded_for_review' not in st.session_state:
                 st.session_state.draft_loaded_for_review = False
 
@@ -1294,14 +1552,29 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
 
             if st.session_state.get('enhancing'):
                 progress_bar, status_text = st.progress(0), st.empty()
-                st.caption(f"최종 검토 실행 중: AI 호출은 {'+'.join(str(t) for t in LLM_RETRY_TIMEOUTS)}초로 최대 {len(LLM_RETRY_TIMEOUTS)}회 재시도 후에만 원문 유지로 넘어갑니다. 최근 처리 로그가 아래에 표시됩니다.")
+                st.caption(f"최종 검토 실행 중: AI 호출은 {'+'.join(str(t) for t in LLM_RETRY_TIMEOUTS)}초로 최대 {len(LLM_RETRY_TIMEOUTS)}회 재시도 후에만 원문 유지로 넘어갑니다. 처리된 섹션은 즉시 DB에 저장되어 중단되어도 이어서 진행할 수 있습니다.")
                 log_container = st.empty()
-                final_proposal_text = enhance_proposal(st.session_state.draft_to_enhance, review_criteria, project_data.get('page_count', 15), status_text, progress_bar, log_container)
-                st.session_state.final_proposal = final_proposal_text
-                save_stage_result(st.session_state.project_id, "4단계: 최종본", st.session_state.final_proposal)
-                st.session_state.enhancing = False
-                # 검토 영역을 닫지 않고 유지해 즉시 재검증이 가능하게 한다.
-                if 'draft_to_enhance' in st.session_state: del st.session_state['draft_to_enhance']
+                try:
+                    final_proposal_text = enhance_proposal(
+                        st.session_state.draft_to_enhance,
+                        review_criteria,
+                        project_data.get('page_count', 15),
+                        status_text,
+                        progress_bar,
+                        log_container,
+                        project_id=project_id,
+                        resume=st.session_state.get('resume_stage4', True),
+                    )
+                    st.session_state.final_proposal = final_proposal_text
+                    save_stage_result(st.session_state.project_id, "4단계: 최종본", st.session_state.final_proposal)
+                    # 정상 종료 시 진행분은 정리 (재실행 시 불필요한 캐시 방지)
+                    clear_progress(project_id, "stage4_enhance_body")
+                    clear_progress(project_id, "stage4_enhance_toc")
+                    st.session_state.resume_stage4 = False
+                finally:
+                    # 예외/리로드 시에도 플래그를 반드시 해제 → LLM 폭주 방지 (P1-3)
+                    st.session_state.enhancing = False
+                    if 'draft_to_enhance' in st.session_state: del st.session_state['draft_to_enhance']
                 st.rerun()
 
             if 'final_proposal' in st.session_state:

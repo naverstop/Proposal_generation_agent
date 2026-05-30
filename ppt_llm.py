@@ -3,10 +3,10 @@ ppt_llm.py — PPT 생성에 사용할 LLM 선택 로직.
 
 우선순위
   1. CLAUDE_API_KEY(또는 ANTHROPIC_API_KEY)가 설정되어 있으면 Claude 최신 모델 사용.
-     - 모델명은 CLAUDE_MODEL 환경변수로 오버라이드 가능. 기본값: "claude-opus-4-5".
-     - (참고) 사용자가 "Claude 4.8"을 원할 경우 .env에 CLAUDE_MODEL=claude-opus-4-8 등으로
-       지정하면 즉시 적용된다. Anthropic이 신규 모델 ID를 공개하면 환경변수만 바꾸면 된다.
-  2. 위가 실패하거나 키가 없으면 Gemini (gemini-2.5-pro)로 fallback.
+     - 모델명은 CLAUDE_MODEL 환경변수로 오버라이드 가능. 기본값: "claude-opus-4-8".
+     - (참고) Anthropic이 신규 모델 ID를 공개하면 .env의 CLAUDE_MODEL만 바꾸면 즉시 적용된다.
+       자동 디스커버리(`llm_config.claude_model()`)가 우선이고 이 기본값은 안전망이다.
+  2. 위가 실패하거나 키가 없으면 Gemini (gemini-pro-latest 별칭)로 fallback.
 
 반환값: (llm_instance, display_name)
 """
@@ -22,7 +22,7 @@ except Exception:
     _log = logging.getLogger("ppt_llm")
 
 
-DEFAULT_CLAUDE_MODEL = "claude-opus-4-5"  # llm_config 자동 디스커버리 실패 시 safety net
+DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"  # llm_config 자동 디스커버리 실패 시 safety net (현재 최신 stable)
 
 
 def _temperature_deprecated(model_id: str) -> bool:

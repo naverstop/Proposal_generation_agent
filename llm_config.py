@@ -12,7 +12,7 @@ llm_config.py — Gemini / Claude 모델명 단일 설정.
 환경변수
 - GEMINI_PRO_MODEL    (default: "gemini-pro-latest")   — 본문/품질강화/검증 등 고난이도 작업
 - GEMINI_FLASH_MODEL  (default: "gemini-flash-latest") — 목차 추출/요약 등 빠른 작업
-- CLAUDE_MODEL        (default: 자동 디스커버리 또는 "claude-opus-4-5") — PPT 슬라이드 생성
+- CLAUDE_MODEL        (default: 자동 디스커버리 또는 "claude-opus-4-8") — PPT 슬라이드 생성
 - CLAUDE_TIER         (default: "opus") — 자동 디스커버리 대상 티어. opus|sonnet|haiku
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ except Exception:
 
 DEFAULT_GEMINI_PRO = "gemini-pro-latest"
 DEFAULT_GEMINI_FLASH = "gemini-flash-latest"
-DEFAULT_CLAUDE_FALLBACK = "claude-opus-4-5"  # API 디스커버리 실패 시 안전 기본값
+DEFAULT_CLAUDE_FALLBACK = "claude-opus-4-8"  # API 디스커버리 실패 시 안전 기본값 (현재 최신 stable)
 
 # 디스커버리 결과 캐시 (1시간)
 _CLAUDE_CACHE: dict = {"model": None, "ts": 0.0}

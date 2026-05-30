@@ -350,6 +350,20 @@ div[data-testid="stDataFrame"] {
 .appx-api-error { background: var(--appx-danger-soft); border-color: var(--appx-danger); }
 .appx-api-error .appx-api-msg { color: var(--appx-danger); font-weight: 700; }
 
+/* Active model chips (under API bar) */
+.appx-model-bar {
+    display: flex; flex-wrap: wrap; gap: 6px;
+    margin: -8px 0 14px 0;
+    padding: 0 2px;
+}
+.appx-model-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px;
+    font-size: 0.72rem; color: var(--appx-text-muted);
+    background: var(--appx-surface-2); border: 1px solid var(--appx-border);
+}
+.appx-model-chip b { color: var(--appx-text); font-weight: 700; }
+
 /* Login hero */
 .appx-login-hero {
     background: linear-gradient(135deg, #2563EB 0%, #7C3AED 100%);

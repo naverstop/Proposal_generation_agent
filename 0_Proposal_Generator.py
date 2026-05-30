@@ -33,10 +33,11 @@ from logging_setup import setup_logging, get_logger, log_event
 setup_logging()
 log = get_logger("APP")
 
-# --- 0-2. 공통 UI 테마 / API 상태 ---
+# --- 0-2. 공통 UI 테마 / API 상태 / LLM 설정 ---
 from ui_theme import inject_global_css, page_header, render_stepper
 from api_status import render_api_status_bar
 from ppt_llm import get_ppt_llm
+from llm_config import gemini_pro_model, gemini_flash_model, get_active_models
 # Streamlit은 매 인터랙션마다 스크립트를 재실행하므로 1회만 찍는 가드
 if not getattr(setup_logging, "_boot_logged", False):
     log.info("==== 서비스 로딩 시작 (Proposal Generator) ====")
@@ -459,7 +460,7 @@ def get_search_tool():
 
 def get_title_recommendations(documents):
     # 단일 호출 방식: 문서 전체를 15000자로 잘라 한 번에 전송 (map_reduce 대비 수십 배 빠름)
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.5, google_api_key=gemini_api_key, max_retries=LLM_SDK_MAX_RETRIES)
+    llm = ChatGoogleGenerativeAI(model=gemini_flash_model(), temperature=0.5, google_api_key=gemini_api_key, max_retries=LLM_SDK_MAX_RETRIES)
     full_text = "\n\n".join([doc.page_content for doc in documents])[:15000]
     prompt = PromptTemplate.from_template(
         "다음 문서 내용을 분석하여, 전체 내용을 가장 잘 대표하는 전문적인 '제안서 주제명' 5가지를 추천해주세요.\n"
@@ -471,7 +472,7 @@ def get_title_recommendations(documents):
     return [line.strip().split('. ', 1)[-1] for line in recommendations_str.split('\n') if line.strip()][:5]
 
 def generate_detailed_toc(topic, core_toc, documents):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.3, google_api_key=gemini_api_key, max_retries=LLM_SDK_MAX_RETRIES)
+    llm = ChatGoogleGenerativeAI(model=gemini_pro_model(), temperature=0.3, google_api_key=gemini_api_key, max_retries=LLM_SDK_MAX_RETRIES)
     full_text = "\n\n".join([doc.page_content for doc in documents])
     prompt = PromptTemplate.from_template(
         "당신은 전문 제안서 컨설턴트입니다. 아래 '확정된 주제'를 명확히 인지하고, 주어진 '핵심 목차'의 구조는 유지하면서, '참고 자료'를 분석하여 가장 관련성 높은 내용으로 전문적인 '세부 목차'를 제안해주세요.\n"
@@ -488,7 +489,7 @@ def generate_detailed_toc(topic, core_toc, documents):
     return chain.stream({"topic": topic, "core_toc": core_toc, "context": full_text[:10000]})
 
 def generate_toc(topic, documents):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.3, google_api_key=gemini_api_key, max_retries=LLM_SDK_MAX_RETRIES)
+    llm = ChatGoogleGenerativeAI(model=gemini_pro_model(), temperature=0.3, google_api_key=gemini_api_key, max_retries=LLM_SDK_MAX_RETRIES)
     full_text = "\n\n".join([doc.page_content for doc in documents])
     prompt = PromptTemplate.from_template(
         "당신은 전문 제안서 컨설턴트입니다. 아래 '주제'와 '참고 자료'를 바탕으로 전문적인 제안서 목차를 생성해주세요.\n"
@@ -504,7 +505,7 @@ def generate_toc(topic, documents):
     return chain.stream({"topic": topic, "context": full_text[:10000]})
 
 def generate_section_content_openai(section, topic, toc, documents, page_count, total_sections, attempt_timeout=LLM_TIMEOUT_SECONDS):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.6, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
+    llm = ChatGoogleGenerativeAI(model=gemini_pro_model(), temperature=0.6, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
     full_text = "\n\n".join([doc.page_content for doc in documents]) if documents else "제공된 참고 자료 없음"
     section_pages = max(page_count / total_sections, 1)
     section_words = int(section_pages * 500)
@@ -571,7 +572,7 @@ def generate_section_with_citations(section, topic, toc, documents, search_tool,
         retrieved_context += f"### 검색자료_{i+1}\n- 제목: {res.get('title', 'N/A')}\n- 링크: {res.get('link', 'N/A')}\n- 요약: {res.get('snippet', 'N/A')}\n\n"
 
     status_text.text(f"🔄 ({st.session_state.current_section_index + 1}/{st.session_state.total_sections}) '{section}' 자료 분석 및 내용 생성 중...")
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.6, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
+    llm = ChatGoogleGenerativeAI(model=gemini_pro_model(), temperature=0.6, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
     prompt = PromptTemplate.from_template(
         "당신은 최고 수준의 전문 리서처이자 제안서 작성 전문가입니다. 당신의 임무는 '{section}'에 대한 논점을 제시하고, 검색된 자료를 바탕으로 그 논점을 뒷받침하는 근거를 제시하는 것입니다.\n\n"
         "**[작업 절차 및 규칙]**\n"
@@ -707,11 +708,11 @@ def _notify_llm_retry(kind, attempt_index, total_attempts, exc):
         pass
 
 def call_llm_api_for_body_processing(prompt_text, attempt_timeout=LLM_TIMEOUT_SECONDS):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.5, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
+    llm = ChatGoogleGenerativeAI(model=gemini_pro_model(), temperature=0.5, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
     return llm.invoke(prompt_text).content
 
 def call_llm_api_for_toc_suggestion(prompt_text, attempt_timeout=LLM_TIMEOUT_SECONDS):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.4, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
+    llm = ChatGoogleGenerativeAI(model=gemini_pro_model(), temperature=0.4, google_api_key=gemini_api_key, timeout=attempt_timeout, max_retries=LLM_SDK_MAX_RETRIES)
     response_str = llm.invoke(prompt_text).content.strip()
     try:
         if response_str.startswith("```json"):

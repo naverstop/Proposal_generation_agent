@@ -48,13 +48,18 @@ def get_ppt_llm(gemini_api_key: str, max_retries: int = 1, temperature: float = 
         except Exception as e:
             _log.warning(f"Claude 초기화 실패({e}) → Gemini로 fallback.")
 
-    # Fallback: Gemini
+    # Fallback: Gemini (최신 안정 별칭 자동 적용)
     from langchain_google_genai import ChatGoogleGenerativeAI
+    try:
+        from llm_config import gemini_pro_model
+        model_name = gemini_pro_model()
+    except Exception:
+        model_name = "gemini-pro-latest"
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-pro",
+        model=model_name,
         temperature=temperature,
         google_api_key=gemini_api_key,
         max_retries=max_retries,
     )
-    _log.info("PPT LLM = Gemini (gemini-2.5-pro)")
-    return llm, "Gemini · gemini-2.5-pro"
+    _log.info(f"PPT LLM = Gemini ({model_name})")
+    return llm, f"Gemini · {model_name}"

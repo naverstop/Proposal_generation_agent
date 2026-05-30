@@ -198,7 +198,12 @@ def scrape_seoul_ai(agency):
 
 def generate_summary_report(agency_name, announcements, template):
     """AI를 사용하여 기관별 공고 목록을 요약 리포트로 생성합니다."""
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.3, google_api_key=GEMINI_API_KEY)
+    try:
+        from llm_config import gemini_pro_model
+        _mname = gemini_pro_model()
+    except Exception:
+        _mname = "gemini-pro-latest"
+    llm = ChatGoogleGenerativeAI(model=_mname, temperature=0.3, google_api_key=GEMINI_API_KEY)
     
     prompt = PromptTemplate.from_template(template)
     

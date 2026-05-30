@@ -127,6 +127,20 @@ _ICON = {"ok": "🟢", "warn": "🟡", "error": "🔴"}
 _LABEL = {"ok": "정상", "warn": "경고", "error": "오류"}
 
 
+def _active_models_html() -> str:
+    """현재 .env 설정에 따른 활성 모델명을 작은 칩으로 표시."""
+    try:
+        from llm_config import get_active_models
+        models = get_active_models()
+    except Exception:
+        return ""
+    chips = "".join(
+        f'<span class="appx-model-chip"><b>{name}</b> · {model}</span>'
+        for name, model in models.items()
+    )
+    return f'<div class="appx-model-bar">{chips}</div>'
+
+
 def render_api_status_bar() -> None:
     """페이지 상단 API 상태 바. 오류·경고가 있으면 추가 알림 배너도 출력."""
     statuses = check_all_apis()
@@ -146,6 +160,7 @@ def render_api_status_bar() -> None:
         '<span class="appx-api-bar-title">외부 API 상태</span>'
         f'{"".join(pills)}'
         '</div>'
+        f'{_active_models_html()}'
     )
     st.markdown(bar_html, unsafe_allow_html=True)
 

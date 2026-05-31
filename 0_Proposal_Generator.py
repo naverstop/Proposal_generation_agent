@@ -60,7 +60,7 @@ def _parse_retry_timeouts(raw_value, default_sequence):
     except ValueError:
         return default_sequence
 
-LLM_RETRY_TIMEOUTS = _parse_retry_timeouts(os.getenv("LLM_RETRY_TIMEOUTS", "60,120"), [60, 120])
+LLM_RETRY_TIMEOUTS = _parse_retry_timeouts(os.getenv("LLM_RETRY_TIMEOUTS", "180,300"), [180, 300])
 LLM_TIMEOUT_SECONDS = max(LLM_RETRY_TIMEOUTS)
 # PPT 생성 전용 단계 재시도 타임아웃(초). 기본 5분 × 4회 = 최대 20분.
 # map_reduce 체인이 청크별 LLM 호출을 다수 수행하므로 단일 호출보다 넉넉하게 둔다.
@@ -621,13 +621,19 @@ def update_live_progress(status_text, progress_bar, message, progress_value):
     safe_progress = clamp_progress(progress_value)
     percent = int(round(safe_progress * 100))
     status_text.text(f"🔄 {message} ({percent}%/100%)")
-    progress_bar.progress(safe_progress)
+    try:
+        progress_bar.progress(safe_progress, text=f"전체 {percent} % / 100 % · {message}")
+    except TypeError:
+        # 구버전 호환 (text 인자 미지원)
+        progress_bar.progress(safe_progress)
 
 def append_enhancement_log(log_container, logs, message):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     logs.append(f"[{timestamp}] {message}")
     visible_logs = logs[-ENHANCEMENT_LOG_LIMIT:]
-    log_container.text("실행 로그\n" + "\n".join(visible_logs))
+    # 최신순으로 표시 (사용자가 스크롤 없이 최신 확인)
+    visible_logs_rev = list(reversed(visible_logs))
+    log_container.text("📜 4단계 실행 로그 (최신순)\n" + "\n".join(visible_logs_rev))
 
 def execute_with_timeout(task, *args, timeout_seconds=LLM_TIMEOUT_SECONDS, on_tick=None, **kwargs):
     """
@@ -675,7 +681,11 @@ def execute_with_retries(task, *args, timeouts=None, on_attempt=None, on_wait=No
             _notify_llm_retry("timeout", attempt_index, total_attempts, exc)
             continue
         except Exception as exc:
-            # SDK 내부 에러(네트워크·쿠타·JSON 오류 등)도 동일하게 재시도
+            # --- (Quota) 결제 한도/할당량 초과는 재시도해도 동일 → 즉시 중단 ---
+            if _is_quota_error(exc):
+                _notify_llm_retry("quota", attempt_index, total_attempts, exc)
+                raise QuotaExceededError(str(exc)) from exc
+            # SDK 내부 에러(네트워크·일시 오류·JSON 오류 등)는 재시도
             last_error = exc
             # Gemini 504/DeadlineExceeded는 사용자에게 즉시 노출 (stderr 로그가 UI에 안 보이므로)
             err_text = f"{type(exc).__name__}: {exc}"
@@ -688,20 +698,87 @@ def execute_with_retries(task, *args, timeouts=None, on_attempt=None, on_wait=No
     raise last_error if last_error else TimeoutError("재시도 정책이 비어 있습니다.")
 
 
+class QuotaExceededError(Exception):
+    """Gemini/OpenAI 등 LLM 제공자의 결제 한도 또는 분당/일별 할당량 초과를 명확히 구분하기 위한 예외."""
+    pass
+
+
+def _is_quota_error(exc) -> bool:
+    """예외 메시지에 결제 한도/할당량 초과를 의미하는 시그니처가 있는지 판단."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    signatures = (
+        "resourceexhausted",
+        "spending cap",
+        "quota",
+        "rate limit",
+        "ratelimit",
+        " 429",  # HTTP 429
+        "(429)",
+        "exceeded its monthly",
+    )
+    return any(sig in text for sig in signatures)
+
+
+def render_quota_dialog(message: str = "", provider: str = "Gemini"):
+    """Quota/결제 한도 초과를 사용자에게 명확히 안내하고 해결 링크를 제공한다.
+    Streamlit 1.30+ 의 st.dialog 데코레이터가 있으면 모달로, 없으면 st.error 배너로 표시한다."""
+    short = (message or "")[:400]
+
+    def _body():
+        st.error("🚫 LLM 제공자의 결제 한도(또는 할당량)가 초과되었습니다.")
+        st.markdown(
+            f"**제공자:** {provider}\n\n"
+            "재시도를 반복해도 동일한 차단이 발생하므로 작업을 즉시 중단했습니다. "
+            "이미 처리된 섹션은 DB에 저장되어 있어 한도 해제 후 ‘이어서 진행’으로 재사용됩니다."
+        )
+        if short:
+            st.code(short, language="text")
+        st.markdown("##### 해결 방법")
+        st.markdown(
+            "1. 아래 ‘AI Studio 결제 한도 페이지’에서 **monthly spending cap을 상향/해제**\n"
+            "2. 또는 다른 결제가 활성화된 프로젝트의 `GEMINI_API_KEY`로 교체 후 앱 재시작\n"
+            "3. 분당 호출 한도(QPM) 초과라면 잠시 후 다시 시도\n"
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.link_button("🔗 AI Studio 결제 한도 페이지 열기", "https://ai.studio/spend", use_container_width=True)
+        with c2:
+            st.link_button("📖 Gemini Billing 문서", "https://ai.google.dev/gemini-api/docs/billing#project-spend-caps", use_container_width=True)
+
+    dialog_decorator = getattr(st, "dialog", None)
+    if callable(dialog_decorator):
+        try:
+            @st.dialog("🚫 결제 한도(Quota) 초과 — 작업 중단")
+            def _modal():
+                _body()
+            _modal()
+            return
+        except Exception:
+            pass
+    # 폴백: 모달 미지원 환경
+    with st.container():
+        st.markdown("---")
+        _body()
+        st.markdown("---")
+
+
+
 def _notify_llm_retry(kind, attempt_index, total_attempts, exc):
     """LLM 재시도 발생 시 Streamlit UI에 토스트로 노출. Streamlit 컨텍스트 밖에서는 stderr로만 출력."""
     msg_map = {
         "timeout": f"⏱ LLM 응답이 시도 {attempt_index}/{total_attempts}에서 타임아웃되었습니다. 다음 시도로 진행합니다.",
         "deadline_504": f"🚨 Gemini 504(DeadlineExceeded) 시도 {attempt_index}/{total_attempts} — Google 측 응답 지연. 다음 시도로 넘어갑니다.",
         "error": f"⚠️ LLM 오류 시도 {attempt_index}/{total_attempts}: {type(exc).__name__}",
+        "quota": f"🚫 결제 한도/할당량 초과 감지 (시도 {attempt_index}) — 재시도 중단",
     }
     msg = msg_map.get(kind, str(exc))
     # 콘솔 로깅 (백엔드 운영자에게 즉시 가시화)
     _lg = get_logger("LLM")
-    log_level = "error" if kind in ("deadline_504",) else "warning"
+    log_level = "error" if kind in ("deadline_504", "quota") else "warning"
     getattr(_lg, log_level)(f"retry={kind} attempt={attempt_index}/{total_attempts} err={type(exc).__name__}: {exc}")
     try:
-        st.toast(msg, icon="🚨" if kind == "deadline_504" else "⚠️")
+        icon = "🚨" if kind == "deadline_504" else ("🚫" if kind == "quota" else "⚠️")
+        st.toast(msg, icon=icon)
         if kind == "deadline_504" and attempt_index == total_attempts:
             st.warning(
                 "Gemini API가 반복적으로 504(DeadlineExceeded)를 반환했습니다. 이 섹션은 폴백(원문 유지)으로 처리됩니다. "
@@ -790,6 +867,9 @@ def process_body_section(text, review_criteria, page_count, on_wait=None, on_att
         total_budget = sum(LLM_RETRY_TIMEOUTS)
         st.warning(f"⚠️ 본문 개선이 {len(LLM_RETRY_TIMEOUTS)}회 재시도(총 {total_budget}초) 안에 끝나지 않아 원문을 유지합니다.")
         return text, f"본문 개선 재시도 모두 시간 초과로 원문 유지"
+    except QuotaExceededError:
+        # quota는 즉시 위로 전파해서 4단계 루프 자체를 중단시킨다
+        raise
     except Exception as e:
         st.warning(f"⚠️ 본문 개선 중 오류가 발생해 원문을 유지합니다: {e}")
         return text, f"본문 개선 실패로 원문 유지: {e}"
@@ -848,6 +928,8 @@ def suggest_refined_toc_title(item, full_content, on_wait=None, on_attempt=None)
     except TimeoutError:
         total_budget = sum(LLM_RETRY_TIMEOUTS)
         return item['text'], f"목차 강화 {len(LLM_RETRY_TIMEOUTS)}회 재시도(총 {total_budget}초) 초과로 기존 제목 유지"
+    except QuotaExceededError:
+        raise
     except Exception as e:
         return item['text'], f"목차 강화 실패로 기존 제목 유지: {e}"
 
@@ -964,16 +1046,36 @@ def reassemble_proposal_string(toc_structure, processed_sections):
 
     return "\n\n".join(final_content_parts)
 
-def enhance_proposal(draft_text, review_criteria, page_count, status_text, progress_bar, log_container, project_id=None, resume=True):
+def enhance_proposal(draft_text, review_criteria, page_count, status_text, progress_bar, log_container,
+                     project_id=None, resume=True, section_progress_bar=None, stop_check=None):
+    """4단계 본문/목차 강화 메인 루프.
+
+    section_progress_bar: 현재 섹션 내부 진척바(0~100). 없으면 무시.
+    stop_check: () -> bool. True를 반환하면 다음 섹션 전에 루프를 정지하고 지금까지 결과를 반환한다.
+    """
     logs = []
+    quota_exc: Exception | None = None
+    stopped_by_user = False
+
+    def _fmt_mmss(sec):
+        sec = max(0, int(sec))
+        return f"{sec // 60:02d}:{sec % 60:02d}"
+
+    def _update_section_bar(pct, label):
+        if section_progress_bar is None:
+            return
+        try:
+            section_progress_bar.progress(pct, text=label)
+        except Exception:
+            pass
     try:
         update_live_progress(status_text, progress_bar, "[1/4] 문서 구조 분석 중", 0.03)
-        append_enhancement_log(log_container, logs, "최종 검토를 시작했습니다.")
+        append_enhancement_log(log_container, logs, "🚀 최종 검토(4단계 강화)를 시작했습니다.")
         original_toc, body_map = parse_proposal_string(draft_text)
 
         total_body_sections = len(body_map)
         numbered_toc_sections = len([item for item in original_toc if item.get("number")])
-        append_enhancement_log(log_container, logs, f"분석 완료: 본문 {total_body_sections}개, 목차 {numbered_toc_sections}개 항목을 처리합니다.")
+        append_enhancement_log(log_container, logs, f"📊 분석 완료 — 본문 {total_body_sections}개 · 목차 {numbered_toc_sections}개 항목을 처리합니다.")
 
         # --- (P1-2) 이전 진행분 로드 ---
         body_progress = load_progress_map(project_id, "stage4_enhance_body") if resume else {}
@@ -981,16 +1083,21 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
         if body_progress or toc_progress:
             append_enhancement_log(
                 log_container, logs,
-                f"이전 진행분 발견: 본문 {len(body_progress)}/{total_body_sections}건, 목차 {len(toc_progress)}/{numbered_toc_sections}건 → 이어서 진행합니다.",
+                f"♻️ 이전 진행분 발견 — 본문 {len(body_progress)}/{total_body_sections}건 · 목차 {len(toc_progress)}/{numbered_toc_sections}건 → 이어서 진행합니다.",
             )
 
         update_live_progress(status_text, progress_bar, "[2/4] 본문 내용 개선 준비 중", 0.05)
         processed_body_map = {}
 
         if total_body_sections == 0:
-            append_enhancement_log(log_container, logs, "개선할 본문이 없어 본문 단계는 건너뜁니다.")
+            append_enhancement_log(log_container, logs, "➡️ 개선할 본문이 없어 본문 단계는 건너뜁니다.")
 
         for i, (original_line, content) in enumerate(body_map.items()):
+            # --- 사용자 정지 요청 확인 (섹션 단위로 안전 정지) ---
+            if stop_check and stop_check():
+                append_enhancement_log(log_container, logs, "🛑 사용자 정지 요청 — 본문 강화 루프 정지 (지금까지 결과는 DB에 저장됨)")
+                stopped_by_user = True
+                break
             title_text = original_line.lstrip('# ').strip()
             body_start = 0.05 + (i / max(total_body_sections, 1)) * 0.65
             body_end = 0.05 + ((i + 1) / max(total_body_sections, 1)) * 0.65
@@ -1004,34 +1111,64 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
                     f"[2/4] 본문 재사용 {i+1}/{total_body_sections}: '{title_text}' (이전 결과)",
                     body_end,
                 )
+                _update_section_bar(100, f"현재 섹션 100 % / 100 % · ♻️ 캐시 재사용 ({i+1}/{total_body_sections})")
                 append_enhancement_log(
                     log_container, logs,
-                    f"본문 {i+1}/{total_body_sections} 재사용: '{title_text}' (status={cached.get('status')})",
+                    f"♻️ ({i+1}/{total_body_sections}) '{title_text}' 이전 결과 재사용 (LLM 호출 생략)",
                 )
                 continue
 
             update_live_progress(status_text, progress_bar, f"[2/4] 본문 개선 중 {i+1}/{total_body_sections}: '{title_text}'", body_start)
-            append_enhancement_log(log_container, logs, f"본문 {i+1}/{total_body_sections} 시작: '{title_text}'")
+            _update_section_bar(0, f"현재 섹션 0 % / 100 % · 시작 ({i+1}/{total_body_sections}) '{title_text}'")
+            append_enhancement_log(log_container, logs, f"▶ ({i+1}/{total_body_sections}) '{title_text}' 본문 개선 시작")
 
             section_start_ts = time.monotonic()
-            improved_content, warning_message = process_body_section(
-                content,
-                review_criteria,
-                page_count,
-                on_wait=lambda elapsed, timeout, attempt_index, total_attempts, current_title=title_text, start=body_start, end=body_end, current_index=i+1, total_items=total_body_sections:
-                    update_live_progress(
-                        status_text,
-                        progress_bar,
-                        f"[2/4] 본문 개선 대기 중 {current_index}/{total_items} (재시도 {attempt_index}/{total_attempts}, {int(timeout)}초 제한): '{current_title}' ({int(min(elapsed, timeout))}초 경과)",
-                        start + (min(elapsed / max(timeout, 1), 0.9) * (end - start)),
-                    ),
-                on_attempt=lambda attempt_index, total_attempts, attempt_timeout, current_title=title_text, current_index=i+1, total_items=total_body_sections:
-                    append_enhancement_log(
-                        log_container,
-                        logs,
-                        f"본문 {current_index}/{total_items} '{current_title}' 시도 {attempt_index}/{total_attempts} 시작 ({attempt_timeout}초 제한)",
-                    ),
-            )
+            # 클로저 상태: 마지막 표시 %, attempt 추적 (3단계와 동일 패턴)
+            _sec_pct = {"last": -1}
+            _sec_state = {"attempt_idx": 0, "had_failure": False}
+            try:
+                improved_content, warning_message = process_body_section(
+                    content,
+                    review_criteria,
+                    page_count,
+                    on_wait=lambda elapsed, timeout, attempt_index, total_attempts, current_title=title_text, start=body_start, end=body_end, current_index=i+1, total_items=total_body_sections:
+                        (
+                            update_live_progress(
+                                status_text,
+                                progress_bar,
+                                f"[2/4] 본문 개선 대기 중 {current_index}/{total_items} (재시도 {attempt_index}/{total_attempts}, {int(timeout)}초 제한): '{current_title}' ({int(min(elapsed, timeout))}초 경과)",
+                                start + (min(elapsed / max(timeout, 1), 0.9) * (end - start)),
+                            ),
+                            (lambda _p=int(min(elapsed / max(timeout, 1), 1.0) * 100):
+                                _sec_pct.__setitem__("last", _p) or _update_section_bar(
+                                    _p,
+                                    f"현재 섹션 {_p} % / 100 % (허용 {_fmt_mmss(timeout)} 기준) · 시도 {attempt_index}/{total_attempts} · "
+                                    f"경과 {_fmt_mmss(elapsed)} · 잔여 {_fmt_mmss(max(0, timeout - elapsed))}"
+                                ) if int(min(elapsed / max(timeout, 1), 1.0) * 100) != _sec_pct["last"] else None
+                            )(),
+                        ),
+                    on_attempt=lambda attempt_index, total_attempts, attempt_timeout, current_title=title_text, current_index=i+1, total_items=total_body_sections:
+                        (
+                            _sec_pct.__setitem__("last", -1),
+                            _sec_state.__setitem__("attempt_idx", attempt_index),
+                            _sec_state.__setitem__("had_failure", _sec_state["had_failure"] or attempt_index >= 2),
+                            _update_section_bar(0, f"현재 섹션 0 % / 100 % (허용 {_fmt_mmss(attempt_timeout)} 기준) · 시도 {attempt_index}/{total_attempts}"),
+                            append_enhancement_log(
+                                log_container,
+                                logs,
+                                (f"🔁 ({current_index}/{total_items}) '{current_title}' 재시도 {attempt_index}/{total_attempts} 시작 — 허용 {_fmt_mmss(attempt_timeout)}"
+                                 if attempt_index >= 2 else
+                                 f"▶ ({current_index}/{total_items}) '{current_title}' 시도 {attempt_index}/{total_attempts} 시작 — 허용 {_fmt_mmss(attempt_timeout)}"),
+                            ),
+                        ),
+                )
+            except QuotaExceededError as qexc:
+                quota_exc = qexc
+                append_enhancement_log(
+                    log_container, logs,
+                    f"🚫 ({i+1}/{total_body_sections}) '{title_text}' — 결제 한도/할당량 초과 감지. 강화 루프 즉시 중단.",
+                )
+                break
             elapsed_sec = time.monotonic() - section_start_ts
             processed_body_map[original_line] = improved_content
 
@@ -1042,27 +1179,108 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
                 improved_content, status=section_status, elapsed_sec=elapsed_sec,
             )
 
-            update_live_progress(status_text, progress_bar, f"[2/4] 본문 개선 완료 {i+1}/{total_body_sections}: '{title_text}'", body_end)
-            append_enhancement_log(
-                log_container,
-                logs,
-                warning_message or f"본문 {i+1}/{total_body_sections} 완료: '{title_text}' ({elapsed_sec:.1f}초)",
+            # 폴백 종류 판별: '시간 초과' / '오류' 키워드면 ⛔(빨강), 그 외 단순 폴백은 ⚠️(노랑)
+            _is_hard_fail = bool(warning_message) and (
+                ("시간 초과" in warning_message) or ("타임아웃" in warning_message)
+                or ("timeout" in warning_message.lower()) or ("오류" in warning_message)
+                or ("실패" in warning_message)
+            )
+            _bar_icon = "⛔ 실패" if _is_hard_fail else ("⚠️ 폴백" if warning_message else "✅ 완료")
+            _update_section_bar(
+                100,
+                f"현재 섹션 100 % / 100 % · {_bar_icon} ({_fmt_mmss(elapsed_sec)} / 허용 {_fmt_mmss(LLM_RETRY_TIMEOUTS[0])})",
             )
 
+            update_live_progress(status_text, progress_bar, f"[2/4] 본문 개선 완료 {i+1}/{total_body_sections}: '{title_text}'", body_end)
+
+            # 3단계와 동일하게: 성공/재시도성공/폴백/실패 4가지로 세분화
+            if warning_message and _is_hard_fail:
+                append_enhancement_log(
+                    log_container, logs,
+                    f"⛔ ({i+1}/{total_body_sections}) '{title_text}' — 모든 재시도 실패 → 원문 유지 (소요 {_fmt_mmss(elapsed_sec)}) | {warning_message}",
+                )
+            elif warning_message:
+                append_enhancement_log(
+                    log_container, logs,
+                    f"⚠️ ({i+1}/{total_body_sections}) '{title_text}' — 폴백 본문으로 저장 (소요 {_fmt_mmss(elapsed_sec)}) | {warning_message}",
+                )
+            elif _sec_state.get("had_failure"):
+                append_enhancement_log(
+                    log_container, logs,
+                    f"✅ ({i+1}/{total_body_sections}) '{title_text}' — 재시도 {_sec_state['attempt_idx']}회차 만에 성공 (소요 {_fmt_mmss(elapsed_sec)})",
+                )
+            else:
+                append_enhancement_log(
+                    log_container, logs,
+                    f"✅ ({i+1}/{total_body_sections}) '{title_text}' — 1회 시도로 성공 (소요 {_fmt_mmss(elapsed_sec)})",
+                )
+
+            # 100% 프레임이 화면에 충분히 보이도록 잠시 유지 (3단계와 동일)
+            time.sleep(0.6)
+
+        # quota/사용자 정지로 빠져나온 경우 목차 강화를 건너뛰고 지금까지 결과를 조립한다
+        if quota_exc is not None or stopped_by_user:
+            update_live_progress(status_text, progress_bar, "[2/4] 본문 단계 중단됨 → 부분 결과 조립", 0.70)
+            append_enhancement_log(log_container, logs, "🛑 본문 단계 중단 — 목차 강화를 건너뛰고 부분 결과를 조립합니다.")
+            partial_text = reassemble_proposal_string(
+                [item.copy() for item in original_toc], processed_body_map
+            ) if processed_body_map else draft_text
+            if quota_exc is not None:
+                # 4단계 페이지에서 다이얼로그를 띄울 수 있도록 명시적으로 raise
+                raise quota_exc
+            progress_bar.progress(0.70)
+            status_text.warning("🛑 사용자 정지로 본문 단계에서 중단되었습니다.")
+            return partial_text
+
         update_live_progress(status_text, progress_bar, "[3/4] 목차 구조 강화 준비 중", 0.70)
-        append_enhancement_log(log_container, logs, "목차 강화 단계를 시작합니다.")
+        append_enhancement_log(log_container, logs, "📑 목차 강화 단계를 시작합니다.")
 
         # --- (P1-2) 목차 강화도 캐시 활용 + 결과 영속화 ---
+        # 목차 항목별 attempt 추적 (본문과 동일 패턴)
+        _toc_attempt = {"by_idx": {}}  # {current_index: {"attempt_idx": int, "had_failure": bool, "started_ts": float}}
+
         def _on_toc_done(current_index, total_items, item, warning_message):
             update_live_progress(
                 status_text, progress_bar,
                 f"[3/4] 목차 강화 완료 {current_index}/{total_items}: '{item['text']}'",
                 0.70 + (current_index / max(total_items, 1)) * 0.25,
             )
-            append_enhancement_log(
-                log_container, logs,
-                warning_message or f"목차 {current_index}/{total_items} 완료: '{item['text']}'",
+            _st = _toc_attempt["by_idx"].get(current_index, {})
+            _elapsed = time.monotonic() - _st.get("started_ts", time.monotonic())
+            _attempt_idx = _st.get("attempt_idx", 1)
+            _had_fail = _st.get("had_failure", False)
+
+            _is_hard_fail = bool(warning_message) and (
+                ("시간 초과" in warning_message) or ("타임아웃" in warning_message)
+                or ("timeout" in warning_message.lower()) or ("오류" in warning_message)
+                or ("실패" in warning_message)
             )
+            _bar_icon = "⛔ 실패" if _is_hard_fail else ("⚠️ 폴백" if warning_message else "✅ 완료")
+            _update_section_bar(
+                100,
+                f"현재 섹션 100 % / 100 % · {_bar_icon} (소요 {_fmt_mmss(_elapsed)})",
+            )
+
+            if warning_message and _is_hard_fail:
+                append_enhancement_log(
+                    log_container, logs,
+                    f"⛔ 목차 ({current_index}/{total_items}) '{item['text']}' — 모든 재시도 실패 → 원문 유지 (소요 {_fmt_mmss(_elapsed)}) | {warning_message}",
+                )
+            elif warning_message:
+                append_enhancement_log(
+                    log_container, logs,
+                    f"⚠️ 목차 ({current_index}/{total_items}) '{item['text']}' — 폴백 (원문 유지, 소요 {_fmt_mmss(_elapsed)}) | {warning_message}",
+                )
+            elif _had_fail:
+                append_enhancement_log(
+                    log_container, logs,
+                    f"✅ 목차 ({current_index}/{total_items}) '{item['text']}' — 재시도 {_attempt_idx}회차 만에 성공 (소요 {_fmt_mmss(_elapsed)})",
+                )
+            else:
+                append_enhancement_log(
+                    log_container, logs,
+                    f"✅ 목차 ({current_index}/{total_items}) '{item['text']}' — 1회 시도로 성공 (소요 {_fmt_mmss(_elapsed)})",
+                )
             try:
                 save_progress_item(
                     project_id, "stage4_enhance_toc", item.get("original_line", item['text']),
@@ -1072,46 +1290,73 @@ def enhance_proposal(draft_text, review_criteria, page_count, status_text, progr
                 # 목차 진행분 저장 실패는 사용자에게도 알린다 (재실행/이어서 진행에 영향)
                 notify("warning", f"목차 진행분 저장 실패: {_se}. 재실행 시 이 항목은 다시 처리됩니다.")
                 append_enhancement_log(log_container, logs, f"⚠️ 목차 진행분 저장 실패: {_se}")
+            time.sleep(0.6)
 
-        refined_toc = refine_table_of_contents(
-            original_toc,
-            processed_body_map,
-            on_item_start=lambda current_index, total_items, item:
-                (
-                    update_live_progress(
-                        status_text,
-                        progress_bar,
-                        f"[3/4] 목차 강화 중 {current_index}/{total_items}: '{item['text']}'",
-                        0.70 + ((current_index - 1) / max(total_items, 1)) * 0.25,
+        try:
+            refined_toc = refine_table_of_contents(
+                original_toc,
+                processed_body_map,
+                on_item_start=lambda current_index, total_items, item:
+                    (
+                        update_live_progress(
+                            status_text,
+                            progress_bar,
+                            f"[3/4] 목차 강화 중 {current_index}/{total_items}: '{item['text']}'",
+                            0.70 + ((current_index - 1) / max(total_items, 1)) * 0.25,
+                        ),
+                        _toc_attempt["by_idx"].__setitem__(current_index, {"attempt_idx": 0, "had_failure": False, "started_ts": time.monotonic()}),
+                        _update_section_bar(0, f"현재 섹션 0 % / 100 % · 목차 강화 ({current_index}/{total_items}) '{item['text']}'"),
+                        append_enhancement_log(log_container, logs, f"▶ 목차 ({current_index}/{total_items}) '{item['text']}' 강화 시작")
                     ),
-                    append_enhancement_log(log_container, logs, f"목차 {current_index}/{total_items} 시작: '{item['text']}'")
-                ),
-            on_item_wait=lambda current_index, total_items, item, elapsed, timeout, attempt_index, total_attempts:
-                update_live_progress(
-                    status_text,
-                    progress_bar,
-                    f"[3/4] 목차 강화 대기 중 {current_index}/{total_items} (재시도 {attempt_index}/{total_attempts}, {int(timeout)}초 제한): '{item['text']}' ({int(min(elapsed, timeout))}초 경과)",
-                    0.70 + (((current_index - 1) + min(elapsed / max(timeout, 1), 0.9)) / max(total_items, 1)) * 0.25,
-                ),
-            on_item_attempt=lambda current_index, total_items, item, attempt_index, total_attempts, attempt_timeout:
-                append_enhancement_log(
-                    log_container,
-                    logs,
-                    f"목차 {current_index}/{total_items} '{item['text']}' 시도 {attempt_index}/{total_attempts} 시작 ({attempt_timeout}초 제한)",
-                ),
-            on_item_done=_on_toc_done,
-            cached_titles={k: v.get("payload") for k, v in toc_progress.items() if v.get("payload")},
-        )
+                on_item_wait=lambda current_index, total_items, item, elapsed, timeout, attempt_index, total_attempts:
+                    (
+                        update_live_progress(
+                            status_text,
+                            progress_bar,
+                            f"[3/4] 목차 강화 대기 중 {current_index}/{total_items} (재시도 {attempt_index}/{total_attempts}, {int(timeout)}초 제한): '{item['text']}' ({int(min(elapsed, timeout))}초 경과)",
+                            0.70 + (((current_index - 1) + min(elapsed / max(timeout, 1), 0.9)) / max(total_items, 1)) * 0.25,
+                        ),
+                        _update_section_bar(
+                            int(min(elapsed / max(timeout, 1), 1.0) * 100),
+                            f"현재 섹션 {int(min(elapsed / max(timeout, 1), 1.0) * 100)} % / 100 % (허용 {_fmt_mmss(timeout)} 기준) · 시도 {attempt_index}/{total_attempts} · 경과 {_fmt_mmss(elapsed)} · 잔여 {_fmt_mmss(max(0, timeout - elapsed))}",
+                        ),
+                    ),
+                on_item_attempt=lambda current_index, total_items, item, attempt_index, total_attempts, attempt_timeout:
+                    (
+                        _toc_attempt["by_idx"].setdefault(current_index, {"attempt_idx": 0, "had_failure": False, "started_ts": time.monotonic()}),
+                        _toc_attempt["by_idx"][current_index].__setitem__("attempt_idx", attempt_index),
+                        _toc_attempt["by_idx"][current_index].__setitem__("had_failure", _toc_attempt["by_idx"][current_index].get("had_failure", False) or attempt_index >= 2),
+                        append_enhancement_log(
+                            log_container,
+                            logs,
+                            (f"🔁 목차 ({current_index}/{total_items}) '{item['text']}' 재시도 {attempt_index}/{total_attempts} 시작 — 허용 {_fmt_mmss(attempt_timeout)}"
+                             if attempt_index >= 2 else
+                             f"▶ 목차 ({current_index}/{total_items}) '{item['text']}' 시도 {attempt_index}/{total_attempts} 시작 — 허용 {_fmt_mmss(attempt_timeout)}"),
+                        ),
+                    ),
+                on_item_done=_on_toc_done,
+                cached_titles={k: v.get("payload") for k, v in toc_progress.items() if v.get("payload")},
+            )
+        except QuotaExceededError as qexc:
+            append_enhancement_log(log_container, logs, "🚫 목차 강화 중 결제 한도/할당량 초과 감지 — 본문까지의 결과로 마감")
+            # 본문은 끝났으므로 원본 목차로 조립
+            partial = reassemble_proposal_string([item.copy() for item in original_toc], processed_body_map)
+            # 외부에서 다이얼로그를 띄울 수 있도록 raise
+            quota_exc = qexc
+            raise
 
         update_live_progress(status_text, progress_bar, "[4/4] 최종 문서 생성 중", 0.95)
-        append_enhancement_log(log_container, logs, "최종 문서를 조립합니다.")
+        append_enhancement_log(log_container, logs, "🧩 최종 문서를 조립합니다.")
         final_text = reassemble_proposal_string(refined_toc, processed_body_map)
 
         update_live_progress(status_text, progress_bar, "[4/4] 저장 및 마무리 중", 0.99)
-        append_enhancement_log(log_container, logs, "최종 문서 생성이 완료되었습니다.")
+        append_enhancement_log(log_container, logs, "🎉 최종 문서 생성이 완료되었습니다.")
         progress_bar.progress(1.0)
         status_text.success("✅ 모든 개선 작업 완료!")
         return final_text
+    except QuotaExceededError:
+        # 4단계 페이지에서 처리 (다이얼로그/배너 표시) — 진행분은 DB에 보존됨
+        raise
     except Exception as e:
         import traceback
         st.error(f"오류: 제안서 개선 작업 중 문제가 발생했습니다. - {e}")
@@ -1309,13 +1554,17 @@ if 'Google Search' not in st.session_state: st.session_state['Google Search'] = 
 if 'active_tab' not in st.session_state: st.session_state.active_tab = "1단계: 제안서 시작"
 if 'generation_stopped' not in st.session_state: st.session_state.generation_stopped = False
 
-# (P1-3) 부팅 시 enhancing 플래그가 남아 있으면 강제로 내린다.
-# Streamlit 리로드/세션 재진입 시 LLM 자동 재호출 폭주를 막는다.
-if st.session_state.get('enhancing'):
-    st.session_state.enhancing = False
-    st.warning("이전 강화 작업이 비정상 종료된 것으로 보여 자동 실행을 중지했습니다. '🔁 재실행' 버튼으로 다시 시작하면 이전 진행분을 재사용합니다.")
-if st.session_state.get('is_generating'):
-    st.session_state.is_generating = False
+# (P1-3) 부팅(세션 최초 진입) 시점에만 enhancing/is_generating 잔존 플래그를 내린다.
+# 주의: Streamlit은 모든 상호작용마다 스크립트를 재실행하므로, 가드 없이 매번
+# 리셋하면 사용자가 '제안서 생성 시작' 버튼을 눌러 is_generating=True로 만든
+# 직후 rerun에서 곧바로 False로 되돌아가 생성 루프가 영원히 시작되지 않는다.
+if not st.session_state.get('_boot_flags_cleared'):
+    st.session_state._boot_flags_cleared = True
+    if st.session_state.get('enhancing'):
+        st.session_state.enhancing = False
+        st.warning("이전 강화 작업이 비정상 종료된 것으로 보여 자동 실행을 중지했습니다. '🔁 재실행' 버튼으로 다시 시작하면 이전 진행분을 재사용합니다.")
+    if st.session_state.get('is_generating'):
+        st.session_state.is_generating = False
 
 # (글로벌 CSS는 ui_theme.inject_global_css()에서 이미 주입됨)
 
@@ -1527,7 +1776,67 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
         stage3_cache = load_progress_map(st.session_state.project_id, "stage3_body")
 
         st.markdown("### 제안서 생성 진행률")
-        progress_bar, status_text = st.progress(0), st.empty()
+        # 전체 진행률(섹션 단위) — '? % / 100 %' 텍스트를 항상 표시
+        progress_bar = st.progress(0, text="전체 0 % / 100 %")
+        # 현재 섹션 내부 진척(LLM 호출 경과 기반, 1 % 단위) — PPT 단계와 동일한 UX
+        section_progress_bar = st.progress(0, text="현재 섹션 대기 중...")
+        status_text = st.empty()
+        # --- 하단 누적 진행 로그 (PPT 단계와 동일한 UX) ---
+        stage3_log_lines: list[str] = []
+        stage3_log_container = st.empty()
+
+        def _push_stage3_log(message: str, level: str = "info"):
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            stage3_log_lines.append(f"[{ts}] {message}")
+            # 최신 항목이 맨 위에 오도록 역순으로 표시 (사용자가 스크롤 없이 최신을 바로 확인)
+            recent = list(reversed(stage3_log_lines[-30:]))
+            stage3_log_container.text(
+                "📜 3단계 진행 로그 (최신순, 최근 30건)\n" + "\n".join(recent)
+            )
+            _lg = get_logger("STAGE3")
+            getattr(_lg, level if level in ("info", "warning", "error") else "info")(message)
+
+        def _fmt_mmss(sec):
+            sec = max(0, int(sec))
+            return f"{sec // 60:02d}:{sec % 60:02d}"
+
+        # 클로저 상태(가변): 마지막으로 표시한 정수 진척률(중복 갱신 방지) + 시도 추적
+        _sec_state = {"last_pct": -1, "current_heading": "", "section_idx": 0, "section_total": 0, "attempt_idx": 0, "had_failure": False}
+
+        def _section_label() -> str:
+            return f"({_sec_state['section_idx']}/{_sec_state['section_total']}) '{_sec_state['current_heading']}'"
+
+        def _on_section_attempt(idx, total, t):
+            _sec_state["last_pct"] = -1
+            _sec_state["attempt_idx"] = idx
+            section_progress_bar.progress(
+                0,
+                text=f"현재 섹션 0 % / 100 % (허용 {_fmt_mmss(t)} 기준) · 시도 {idx}/{total} · 잔여 {_fmt_mmss(t)}",
+            )
+            if idx == 1:
+                _sec_state["had_failure"] = False
+                _push_stage3_log(f"▶ {_section_label()} 시도 {idx}/{total} 시작 — 허용 {_fmt_mmss(t)}")
+            else:
+                _sec_state["had_failure"] = True
+                _push_stage3_log(f"🔁 {_section_label()} 재시도 {idx}/{total} 시작 — 허용 {_fmt_mmss(t)}", level="warning")
+
+        def _on_section_wait(elapsed, t, idx, total):
+            if t <= 0:
+                return
+            pct = int(elapsed / t * 100)
+            pct = 0 if pct < 0 else (100 if pct > 100 else pct)
+            if pct == _sec_state["last_pct"]:
+                return  # 1 % 변경 없을 때 UI 갱신 생략
+            _sec_state["last_pct"] = pct
+            remaining = max(0, int(t - elapsed))
+            section_progress_bar.progress(
+                pct,
+                text=(
+                    f"현재 섹션 {pct} % / 100 % (허용 {_fmt_mmss(t)} 기준) · 시도 {idx}/{total} · "
+                    f"경과 {_fmt_mmss(elapsed)} · 잔여 {_fmt_mmss(remaining)}"
+                ),
+            )
+
         full_proposal, all_citations = f"# {final_topic}\n\n", ""
         if final_toc: full_proposal += f"## 목차\n{final_toc}\n\n"
         llm_type = "OpenAI"
@@ -1542,7 +1851,11 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                 if st.session_state.get('generation_stopped'):
                     status_text.warning("사용자 요청으로 정지합니다. 지금까지 처리된 섹션은 DB에 저장되어 다음 실행 시 재사용됩니다.")
                     break
-                progress_bar.progress((i + 1) / st.session_state.total_sections)
+                _overall_pct = int((i + 1) / max(1, st.session_state.total_sections) * 100)
+                progress_bar.progress(
+                    (i + 1) / st.session_state.total_sections,
+                    text=f"전체 {_overall_pct} % / 100 % ({i + 1}/{st.session_state.total_sections}) · '{current_heading}'",
+                )
 
                 is_leaf_node = True
                 current_level_match = re.match(r'^(\d+(\.\d+)*)', current_heading)
@@ -1568,10 +1881,14 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                     cached_item = stage3_cache.get(current_heading)
                     if cached_item and cached_item.get("payload"):
                         status_text.text(f"♻️ ({i+1}/{st.session_state.total_sections}) '{current_heading}' 이전 결과 재사용")
+                        _push_stage3_log(f"♻️ ({i+1}/{st.session_state.total_sections}) '{current_heading}' 이전 결과 재사용 (LLM 호출 생략)")
                         full_proposal += f"{cached_item['payload']}\n\n"
                         continue
 
                     status_text.text(f"🔄 ({i+1}/{st.session_state.total_sections}) '{current_heading}' 섹션 본문 생성 중... (재시도 정책 {'+'.join(str(t) for t in LLM_RETRY_TIMEOUTS)}초)")
+                    _sec_state["current_heading"] = current_heading
+                    _sec_state["section_idx"] = i + 1
+                    _sec_state["section_total"] = st.session_state.total_sections
                     generated_content, citations_for_section = "", ""
                     section_start_ts = time.monotonic()
                     try:
@@ -1586,6 +1903,7 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                                 )
                             generated_content, citations_for_section = execute_with_retries(
                                 _task_with_citations, timeouts=LLM_RETRY_TIMEOUTS,
+                                on_attempt=_on_section_attempt, on_wait=_on_section_wait,
                             )
                         else:
                             def _task_no_citations(attempt_timeout=LLM_TIMEOUT_SECONDS, **_kw):
@@ -1596,13 +1914,22 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                                 )
                             generated_content = execute_with_retries(
                                 _task_no_citations, timeouts=LLM_RETRY_TIMEOUTS,
+                                on_attempt=_on_section_attempt, on_wait=_on_section_wait,
                             )
                     except TimeoutError:
                         total_budget = sum(LLM_RETRY_TIMEOUTS)
                         notify("warning", f"⚠️ '{current_heading}' 생성이 {len(LLM_RETRY_TIMEOUTS)}회 재시도(총 {total_budget}초) 안에 끝나지 않아 빈 본문으로 진행합니다.")
+                        _push_stage3_log(
+                            f"⛔ {_section_label()} — {len(LLM_RETRY_TIMEOUTS)}회 재시도(총 {total_budget}초) 모두 타임아웃 → 폴백 처리",
+                            level="error",
+                        )
                         generated_content = f"[자동 생성 실패: 시간 초과 - '{current_heading}']"
                     except Exception as e:
                         notify("error", f"'{current_heading}' 섹션 생성 중 오류 발생: {e}")
+                        _push_stage3_log(
+                            f"⛔ {_section_label()} — {type(e).__name__}: {e} → 폴백 처리",
+                            level="error",
+                        )
                         generated_content = f"[오류: '{current_heading}' 생성 실패 - {e}]"
 
                     cleaned_section_title = re.sub(r"^\d+(\.\d+)*\s*", "", current_heading).strip()
@@ -1628,9 +1955,31 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                         f"saved status={'ok' if not generated_content.startswith('[') else 'fallback'} "
                         f"elapsed={elapsed_sec:.1f}s"
                     )
+                    section_progress_bar.progress(
+                        100,
+                        text=f"현재 섹션 100 % / 100 % · ✅ 완료 ({_fmt_mmss(elapsed_sec)} / 허용 {_fmt_mmss(LLM_RETRY_TIMEOUTS[0])})",
+                    )
+                    # 하단 누적 로그에 결과 기록 (재시도 후 성공이면 명시)
+                    _ok = not generated_content.startswith("[")
+                    if _ok and _sec_state.get("had_failure"):
+                        _push_stage3_log(
+                            f"✅ {_section_label()} — 재시도 {_sec_state['attempt_idx']}회차 만에 성공 (소요 {_fmt_mmss(elapsed_sec)})"
+                        )
+                    elif _ok:
+                        _push_stage3_log(
+                            f"✅ {_section_label()} — 1회 시도로 성공 (소요 {_fmt_mmss(elapsed_sec)})"
+                        )
+                    else:
+                        _push_stage3_log(
+                            f"⚠️ {_section_label()} — 폴백 본문으로 저장 (소요 {_fmt_mmss(elapsed_sec)})",
+                            level="warning",
+                        )
+                    # 100 % 프레임이 화면에 충분히 보이도록 잠시 유지 (다음 섹션이 0%로 리셋하기 전)
+                    time.sleep(0.6)
 
                 else:
                     status_text.text(f"➡️ ({i+1}/{st.session_state.total_sections}) '{current_heading}' 상위 목차 추가 (본문 생성 건너뜀)")
+                    _push_stage3_log(f"➡️ ({i+1}/{st.session_state.total_sections}) '{current_heading}' 상위 목차 추가 (본문 생성 건너뜀)")
                     full_proposal += "\n"
 
             if not st.session_state.get('generation_stopped'):
@@ -1661,6 +2010,10 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                 if full_proposal.strip():
                     save_stage_result(st.session_state.project_id, "3단계: 본문 생성", full_proposal.strip(), llm_type)
                     notify("info", "중단 시점까지의 부분 초안을 저장했습니다. 다시 '시작'을 누르면 남은 섹션부터 이어서 생성합니다.")
+        except QuotaExceededError as qexc:
+            get_logger("STAGE3").error(f"Quota 초과로 본문 생성 중단: {qexc}")
+            notify("error", "🚫 결제 한도/할당량 초과 — 본문 생성을 중단했습니다. 한도 해제 후 다시 시작하면 진행분부터 이어집니다.")
+            render_quota_dialog(str(qexc), provider="Gemini")
         except Exception as _stage3_exc:
             get_logger("STAGE3").exception(f"치명적 오류: {_stage3_exc}")
             notify("error", f"🚨 3단계 실행 중 치명적 오류: {_stage3_exc}. 진행분은 DB에 보존되어 재실행 시 자동 재사용됩니다.")
@@ -1725,7 +2078,7 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                     )
                     rc1, rc2 = st.columns(2)
                     with rc1:
-                        if st.button("▶ 이어서 진행 (이전 결과 재사용)", use_container_width=True, key="resume_stage4"):
+                        if st.button("▶ 이어서 진행 (이전 결과 재사용)", use_container_width=True, key="btn_resume_stage4"):
                             st.session_state.resume_stage4 = True
                             st.success("다음 강화 실행 시 이전 진행분을 자동으로 이어서 사용합니다.")
                     with rc2:
@@ -1810,9 +2163,17 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                     st.rerun()
 
             if st.session_state.get('enhancing'):
-                progress_bar, status_text = st.progress(0), st.empty()
-                st.caption(f"최종 검토 실행 중: AI 호출은 {'+'.join(str(t) for t in LLM_RETRY_TIMEOUTS)}초로 최대 {len(LLM_RETRY_TIMEOUTS)}회 재시도 후에만 원문 유지로 넘어갑니다. 처리된 섹션은 즉시 DB에 저장되어 중단되어도 이어서 진행할 수 있습니다.")
+                # --- 중단 버튼 (3단계와 동일 UX) ---
+                if st.button("🛑 강화 중단하기 (현재 섹션 종료 후 정지)", use_container_width=True, type="primary", key="stop_stage4"):
+                    st.session_state.stage4_stopped = True
+                    notify("warning", "정지 요청 접수: 진행 중인 섹션이 끝나면 정지합니다. 이미 처리된 섹션은 DB에 저장되어 다음 실행 시 자동 재사용됩니다.")
+                # --- 진척 표시: 전체 + 현재 섹션 + 누적 로그(최신순) ---
+                st.markdown("### 4단계 진행률")
+                progress_bar = st.progress(0, text="전체 0 % / 100 %")
+                section_progress_bar = st.progress(0, text="현재 섹션 대기 중...")
+                status_text = st.empty()
                 log_container = st.empty()
+                st.caption(f"최종 검토 실행 중: AI 호출은 {'+'.join(str(t) for t in LLM_RETRY_TIMEOUTS)}초로 최대 {len(LLM_RETRY_TIMEOUTS)}회 재시도 후에만 원문 유지로 넘어갑니다. 처리된 섹션은 즉시 DB에 저장되어 중단되어도 이어서 진행할 수 있습니다.")
                 # 진입 시 진행분 알림
                 _entry_body = get_progress_summary(project_id, "stage4_enhance_body")
                 _entry_toc = get_progress_summary(project_id, "stage4_enhance_toc")
@@ -1833,23 +2194,35 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                         log_container,
                         project_id=project_id,
                         resume=st.session_state.get('resume_stage4', True),
+                        section_progress_bar=section_progress_bar,
+                        stop_check=lambda: st.session_state.get('stage4_stopped', False),
                     )
                     st.session_state.final_proposal = final_proposal_text
                     save_stage_result(st.session_state.project_id, "4단계: 최종본", st.session_state.final_proposal)
-                    # 정상 종료 후 폴백/완료 알림
-                    _final_body = get_progress_summary(project_id, "stage4_enhance_body") or {}
-                    _final_toc = get_progress_summary(project_id, "stage4_enhance_toc") or {}
-                    _fallback_total = _final_body.get('fallback_count', 0) + _final_toc.get('fallback_count', 0)
-                    if _fallback_total > 0:
-                        notify("warning",
-                               f"⚠️ 4단계 완료 — 다만 {_fallback_total}개 섹션이 LLM 실패로 원문 유지(폴백)로 처리되었습니다. "
-                               "재실행 버튼으로 폴백 섹션만 재시도할 수 있습니다.")
+                    if st.session_state.get('stage4_stopped'):
+                        notify("warning", "🛑 사용자 정지로 4단계가 부분 결과만 저장되었습니다. '이어서 진행'으로 재개할 수 있습니다.")
                     else:
-                        notify("success", "✅ 4단계 검토 완료. 폴백 없이 모두 성공했습니다.")
-                    # 정상 종료 시 진행분은 정리 (재실행 시 불필요한 캐시 방지)
-                    clear_progress(project_id, "stage4_enhance_body")
-                    clear_progress(project_id, "stage4_enhance_toc")
-                    st.session_state.resume_stage4 = False
+                        # 정상 종료 후 폴백/완료 알림
+                        _final_body = get_progress_summary(project_id, "stage4_enhance_body") or {}
+                        _final_toc = get_progress_summary(project_id, "stage4_enhance_toc") or {}
+                        _fallback_total = _final_body.get('fallback_count', 0) + _final_toc.get('fallback_count', 0)
+                        if _fallback_total > 0:
+                            notify("warning",
+                                   f"⚠️ 4단계 완료 — 다만 {_fallback_total}개 섹션이 LLM 실패로 원문 유지(폴백)로 처리되었습니다. "
+                                   "재실행 버튼으로 폴백 섹션만 재시도할 수 있습니다.")
+                        else:
+                            notify("success", "✅ 4단계 검토 완료. 폴백 없이 모두 성공했습니다.")
+                        # 정상 종료 시 진행분은 정리 (재실행 시 불필요한 캐시 방지)
+                        clear_progress(project_id, "stage4_enhance_body")
+                        clear_progress(project_id, "stage4_enhance_toc")
+                        st.session_state.resume_stage4 = False
+                except QuotaExceededError as qexc:
+                    get_logger("STAGE4").error(f"Quota 초과로 강화 중단: {qexc}")
+                    # 진행분은 DB에 그대로 남기고, 다음 진입 시 '이어서 진행' 가능하도록 resume 플래그 유지
+                    st.session_state.resume_stage4 = True
+                    st.session_state._stage4_quota_blocked = True  # 다이얼로그가 사라지지 않도록 rerun 억제
+                    st.session_state._stage4_quota_msg = str(qexc)
+                    notify("error", "🚫 결제 한도/할당량 초과 — 4단계 강화를 중단했습니다. 한도 해제 후 ‘이어서 진행’을 선택하세요.")
                 except Exception as _stage4_exc:
                     get_logger("STAGE4").exception(f"치명적 오류: {_stage4_exc}")
                     notify("error",
@@ -1858,9 +2231,35 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                 finally:
                     # 예외/리로드 시에도 플래그를 반드시 해제 → LLM 폭주 방지 (P1-3)
                     st.session_state.enhancing = False
+                    st.session_state.stage4_stopped = False
                     if 'draft_to_enhance' in st.session_state: del st.session_state['draft_to_enhance']
                     get_logger("STAGE4").info("end (enhancing=False)")
-                st.rerun()
+                # Quota로 막힌 경우 다이얼로그가 화면에 머물도록 rerun을 건너뛴다 (이전 버그: rerun이 즉시 다이얼로그를 소실시킴)
+                if not st.session_state.get('_stage4_quota_blocked'):
+                    st.rerun()
+
+            # Quota 차단 상태일 때 다이얼로그/배너를 페이지 상단에 안정적으로 표시 (사라지지 않음)
+            if st.session_state.get('_stage4_quota_blocked'):
+                st.error(
+                    "🚫 결제 한도/할당량(Quota) 초과로 4단계 강화가 중단되었습니다.\n\n"
+                    "지금까지 처리된 섹션은 DB에 저장되어 있어, 한도 해제 후 '이어서 진행' 버튼을 누르면 LLM 재호출 없이 계속됩니다."
+                )
+                render_quota_dialog(
+                    st.session_state.get('_stage4_quota_msg', '결제 한도/할당량 초과'),
+                    provider="Gemini",
+                )
+                colq1, colq2 = st.columns(2)
+                with colq1:
+                    if st.button("✅ 안내 확인 (배너 닫기)", use_container_width=True, key="btn_dismiss_quota"):
+                        st.session_state._stage4_quota_blocked = False
+                        st.session_state.pop('_stage4_quota_msg', None)
+                        st.rerun()
+                with colq2:
+                    st.link_button(
+                        "🔗 Google AI Studio 결제 한도 페이지 열기",
+                        "https://ai.studio/spend",
+                        use_container_width=True,
+                    )
 
             if 'final_proposal' in st.session_state:
                 st.markdown("---")
@@ -1956,8 +2355,10 @@ elif st.session_state.active_tab == "5단계: PPT 전환":
                     def _push_ppt_log(message: str):
                         ts = datetime.datetime.now().strftime("%H:%M:%S")
                         ppt_log_lines.append(f"[{ts}] {message}")
+                        # 최신순으로 표시 (스크롤 없이 최신 확인)
+                        recent = list(reversed(ppt_log_lines[-30:]))
                         ppt_log_container.text(
-                            "📜 PPT 진행 로그\n" + "\n".join(ppt_log_lines[-30:])
+                            "📜 PPT 진행 로그 (최신순, 최근 30건)\n" + "\n".join(recent)
                         )
 
                     log.info(f"PPT 생성 시작 | 정책={PPT_RETRY_TIMEOUTS} (총 {total_budget_min}분)")

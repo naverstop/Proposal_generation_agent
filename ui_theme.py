@@ -41,6 +41,33 @@ def page_header(title: str, subtitle: str = "", meta: str = "") -> None:
     st.markdown(html, unsafe_allow_html=True)
 
 
+def section_header(title: str, desc: str = "", icon: str = "") -> None:
+    """단계(스테이지) 본문 최상단의 표준 섹션 헤더.
+    st.header()/st.subheader()를 직접 쓰지 말고 이 헬퍼로 통일한다.
+    title : 섹션 제목  ·  desc : 한 줄 보조 설명(선택)  ·  icon : 선행 이모지(선택)"""
+    icon_html = f'<span class="appx-section-icon">{icon}</span>' if icon else ""
+    desc_html = f'<p class="appx-section-desc">{desc}</p>' if desc else ""
+    st.markdown(
+        f'<div class="appx-section">'
+        f'<div class="appx-section-title">{icon_html}{title}</div>'
+        f'{desc_html}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def sub_section(title: str, num: int | str | None = None, desc: str = "") -> None:
+    """섹션 내부의 표준 하위 제목. '1. 제목' 식 번호 표기를 통일한다.
+    num 지정 시 번호 칩을 앞에 붙인다."""
+    num_html = f'<span class="appx-subsection-num">{num}</span>' if num is not None else ""
+    desc_html = f'<span class="appx-subsection-desc">{desc}</span>' if desc else ""
+    st.markdown(
+        f'<div class="appx-subsection">{num_html}'
+        f'<span class="appx-subsection-title">{title}</span>{desc_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def status_badge(label: str, kind: str = "neutral") -> str:
     """상태 배지 HTML. kind ∈ {success, info, warning, danger, neutral}."""
     kind = kind if kind in ("success", "info", "warning", "danger", "neutral") else "neutral"
@@ -75,7 +102,7 @@ def render_stepper(steps: list[str], current_index: int, completed: set[int] | N
             f'<div class="appx-step appx-step-{state}"><div class="appx-step-dot">{icon}</div><div class="appx-step-label">{label}</div></div>'
         )
         if i < len(steps) - 1:
-            line_state = "done" if (i in completed and (i + 1) in completed or i in completed) else "todo"
+            line_state = "done" if i in completed else "todo"
             parts.append(f'<div class="appx-step-line appx-step-line-{line_state}"></div>')
     st.markdown(
         f'<div class="appx-stepper">{"".join(parts)}</div>',
@@ -161,6 +188,36 @@ html, body, [class*="css"], .stApp, .stMarkdown, .stText, .stTitle {
     color: var(--appx-text-muted); font-size: 0.78rem; font-family: ui-monospace, Menlo, monospace;
     white-space: nowrap;
 }
+
+/* Section header (section_header helper) — 단계 본문 표준 헤더 */
+.appx-section {
+    margin: 6px 0 14px 0; padding: 0 0 10px 0;
+    border-bottom: 1px solid var(--appx-border);
+}
+.appx-section-title {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 1.25rem; font-weight: 800; letter-spacing: -0.01em;
+    color: var(--appx-text); line-height: 1.3;
+    border-left: 4px solid var(--appx-primary); padding-left: 12px;
+}
+.appx-section-icon { font-size: 1.2rem; line-height: 1; }
+.appx-section-desc {
+    margin: 6px 0 0 16px; color: var(--appx-text-muted); font-size: 0.9rem;
+}
+
+/* Sub-section heading (sub_section helper) — 섹션 내부 표준 하위 제목 */
+.appx-subsection {
+    display: flex; align-items: center; gap: 8px;
+    margin: 18px 0 8px 0;
+}
+.appx-subsection-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 22px; height: 22px; padding: 0 6px;
+    background: var(--appx-primary-soft); color: var(--appx-primary-hover);
+    border-radius: 999px; font-size: 0.78rem; font-weight: 800;
+}
+.appx-subsection-title { font-size: 1.02rem; font-weight: 700; color: var(--appx-text); }
+.appx-subsection-desc { font-size: 0.82rem; color: var(--appx-text-muted); font-weight: 500; }
 
 /* Buttons */
 .stButton > button, .stDownloadButton > button {
@@ -256,15 +313,178 @@ div[data-testid="stExpander"] {
     box-shadow: var(--appx-shadow-sm);
 }
 
-/* Sidebar */
+/* ===================== Sidebar (premium) ===================== */
 section[data-testid="stSidebar"] {
-    background: var(--appx-surface) !important;
+    background: linear-gradient(180deg, var(--appx-surface) 0%, var(--appx-bg) 100%) !important;
     border-right: 1px solid var(--appx-border);
 }
-section[data-testid="stSidebar"] .stMarkdown h3 {
-    font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.08em;
-    color: var(--appx-text-muted); margin-top: 1.2rem; margin-bottom: 0.4rem;
+section[data-testid="stSidebar"] .block-container { padding-top: 0.8rem; }
+
+/* 접기(collapse) 버튼 강조 */
+[data-testid="stSidebarCollapseButton"] button {
+    border-radius: var(--appx-radius-md) !important;
+    transition: background 0.15s ease, color 0.15s ease;
 }
+[data-testid="stSidebarCollapseButton"] button:hover {
+    background: var(--appx-primary-soft) !important;
+    color: var(--appx-primary-hover) !important;
+}
+
+/* 멀티페이지 네비게이션 (아이콘 + 활성 액센트바) */
+div[data-testid="stSidebarNav"] {
+    padding: 2px 0 10px 0; margin-bottom: 8px;
+    border-bottom: 1px solid var(--appx-border);
+}
+div[data-testid="stSidebarNav"] ul { gap: 3px; }
+div[data-testid="stSidebarNav"] a {
+    position: relative;
+    border-radius: var(--appx-radius-md) !important;
+    padding: 9px 12px !important;
+    transition: background 0.15s ease, color 0.15s ease, transform 0.15s ease;
+}
+div[data-testid="stSidebarNav"] a span { font-weight: 600; }
+div[data-testid="stSidebarNav"] a::before { margin-right: 9px; font-size: 1rem; line-height: 1; }
+div[data-testid="stSidebarNav"] a[href$="/"]::before { content: "📝"; }
+div[data-testid="stSidebarNav"] a[href*="History"]::before { content: "🗂️"; }
+div[data-testid="stSidebarNav"] a:hover { background: var(--appx-primary-soft) !important; transform: translateX(2px); }
+div[data-testid="stSidebarNav"] a[aria-current="page"] { background: var(--appx-primary-soft) !important; }
+div[data-testid="stSidebarNav"] a[aria-current="page"] span { color: var(--appx-primary-hover) !important; font-weight: 700; }
+div[data-testid="stSidebarNav"] a[aria-current="page"]::after {
+    content: ""; position: absolute; left: 0; top: 18%; bottom: 18%;
+    width: 3px; border-radius: 999px; background: var(--appx-primary);
+}
+
+/* 사이드바 섹션 라벨 (### ...) */
+section[data-testid="stSidebar"] .stMarkdown h3 {
+    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--appx-text-muted); font-weight: 800;
+    margin: 1.1rem 0 0.5rem 0;
+}
+
+/* 사이드바 상단 브랜드 (로고 칩 + 타이틀 + 서브) */
+.appx-brand { display: flex; align-items: center; gap: 10px; padding: 4px 2px 10px 2px; }
+.appx-brand-logo {
+    width: 36px; height: 36px; flex-shrink: 0; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center; font-size: 1.2rem;
+    background: linear-gradient(135deg, var(--appx-primary) 0%, #7C3AED 100%);
+    box-shadow: 0 6px 16px -6px rgba(124, 58, 237, 0.6);
+}
+.appx-brand-title { font-weight: 800; font-size: 1rem; color: var(--appx-text); letter-spacing: -0.01em; line-height: 1.1; }
+.appx-brand-sub { font-size: 0.66rem; color: var(--appx-text-muted); letter-spacing: 0.08em; text-transform: uppercase; margin-top: 2px; }
+
+/* 사용자 프로필 카드 */
+.appx-usercard {
+    display: flex; align-items: center; gap: 10px;
+    padding: 11px 12px; margin-bottom: 6px;
+    border: 1px solid var(--appx-border); border-radius: var(--appx-radius-lg);
+    background: var(--appx-surface); box-shadow: var(--appx-shadow-sm);
+}
+.appx-avatar {
+    width: 40px; height: 40px; flex-shrink: 0; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 1.05rem; color: #FFFFFF;
+    background: linear-gradient(135deg, var(--appx-primary) 0%, #7C3AED 100%);
+    box-shadow: 0 4px 10px -4px rgba(37, 99, 235, 0.5);
+    border: 2px solid var(--appx-surface); outline: 2px solid var(--appx-border);
+}
+.appx-avatar-admin {
+    background: linear-gradient(135deg, #F59E0B 0%, #EF4444 100%);
+    outline-color: var(--appx-warning);
+    animation: appx-glow 2.4s ease-in-out infinite;
+}
+@keyframes appx-glow {
+    0%, 100% { box-shadow: 0 4px 10px -4px rgba(245, 158, 11, 0.5); }
+    50%      { box-shadow: 0 0 14px 1px rgba(245, 158, 11, 0.55); }
+}
+.appx-user-meta { min-width: 0; flex: 1; }
+.appx-user-email {
+    font-weight: 700; font-size: 0.84rem; color: var(--appx-text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.appx-role-badge {
+    display: inline-block; margin-top: 4px;
+    padding: 1px 9px; border-radius: 999px;
+    font-size: 0.66rem; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase;
+    border: 1px solid transparent;
+}
+.appx-role-user  { background: var(--appx-info-soft); color: var(--appx-info); border-color: var(--appx-info); }
+.appx-role-admin {
+    color: #FFFFFF; border: none;
+    background: linear-gradient(135deg, #F59E0B 0%, #EF4444 100%);
+    box-shadow: 0 2px 8px -2px rgba(245, 158, 11, 0.6);
+}
+.appx-lastlogin { font-size: 0.7rem; color: var(--appx-text-muted); margin: 2px 2px 8px 2px; }
+
+/* 사이드바 버튼(로그아웃 등) — 폭 맞춤 */
+section[data-testid="stSidebar"] .stButton > button { width: 100%; }
+
+/* 사이드바 진행 상황 패널 */
+.appx-prog { margin-top: 2px; }
+.appx-prog-meta {
+    font-size: 0.72rem; color: var(--appx-text-muted); margin-bottom: 6px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.appx-prog-bar {
+    height: 6px; border-radius: 999px; background: var(--appx-surface-2);
+    overflow: hidden; margin-bottom: 10px;
+}
+.appx-prog-bar > i {
+    display: block; height: 100%; border-radius: 999px;
+    background: linear-gradient(90deg, var(--appx-primary), #7C3AED);
+    transition: width 0.4s ease;
+}
+.appx-prog-step { display: flex; align-items: center; gap: 8px; padding: 5px 7px; border-radius: 8px; font-size: 0.8rem; }
+.appx-prog-step + .appx-prog-step { margin-top: 2px; }
+.appx-prog-ic {
+    width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.62rem; font-weight: 800;
+}
+.appx-prog-done .appx-prog-ic { background: var(--appx-success); color: #fff; }
+.appx-prog-done .appx-prog-label { color: var(--appx-text); }
+.appx-prog-current { background: var(--appx-primary-soft); }
+.appx-prog-current .appx-prog-ic { background: var(--appx-primary); color: #fff; }
+.appx-prog-current .appx-prog-label { color: var(--appx-primary-hover); font-weight: 700; }
+.appx-prog-todo .appx-prog-ic { background: var(--appx-surface-2); color: var(--appx-text-muted); border: 1px solid var(--appx-border-strong); }
+.appx-prog-todo .appx-prog-label { color: var(--appx-text-muted); }
+.appx-prog-label { color: var(--appx-text); }
+.appx-prog-next {
+    margin-top: 9px; padding: 7px 9px; border-radius: 8px;
+    background: var(--appx-surface-2); font-size: 0.72rem; color: var(--appx-text-muted);
+}
+.appx-prog-next b { color: var(--appx-primary-hover); }
+
+/* 사이드바 푸터 (가동 상태 + 버전) */
+.appx-sidebar-footer {
+    display: flex; align-items: center; gap: 7px;
+    margin-top: 16px; padding-top: 10px;
+    border-top: 1px solid var(--appx-border);
+    font-size: 0.7rem; color: var(--appx-text-muted);
+}
+.appx-foot-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--appx-success);
+    animation: appx-pulse 2s infinite;
+}
+@keyframes appx-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55); }
+    70%  { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+.appx-foot-ver { margin-left: auto; font-family: ui-monospace, Menlo, monospace; font-weight: 700; }
+
+/* Board / table cells (History 게시판형 목록 표준) */
+.appx-th {
+    font-size: 0.78rem; font-weight: 700; color: var(--appx-text-muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    padding: 6px 0; border-bottom: 2px solid var(--appx-border);
+}
+.appx-th-center { text-align: center; }
+.appx-td { padding: 10px 0; }
+.appx-td-id    { font-family: ui-monospace, Menlo, monospace; color: var(--appx-text-muted); font-size: 0.88rem; }
+.appx-td-topic { font-weight: 600; font-size: 0.95rem; padding-right: 8px;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.appx-td-topic .appx-untitled { color: var(--appx-text-muted); font-style: italic; font-weight: 400; }
+.appx-td-date  { color: var(--appx-text-muted); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
 
 /* Dataframe */
 div[data-testid="stDataFrame"] {

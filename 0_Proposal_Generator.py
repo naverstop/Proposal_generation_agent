@@ -14,9 +14,18 @@ try:
     from langchain_core.prompts import ChatPromptTemplate
 except ImportError:
     from langchain.prompts import ChatPromptTemplate
-from langchain.prompts import PromptTemplate
-from langchain.chains.summarize import load_summarize_chain
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+try:
+    from langchain_core.prompts import PromptTemplate
+except ImportError:
+    from langchain.prompts import PromptTemplate
+try:
+    from langchain.chains.summarize import load_summarize_chain
+except ImportError:
+    from langchain_classic.chains.summarize import load_summarize_chain
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
 from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
@@ -34,7 +43,7 @@ setup_logging()
 log = get_logger("APP")
 
 # --- 0-2. 공통 UI 테마 / API 상태 / LLM 설정 ---
-from ui_theme import inject_global_css, page_header, render_stepper
+from ui_theme import inject_global_css, page_header, render_stepper, section_header, sub_section
 from api_status import render_api_status_bar
 from ppt_llm import get_ppt_llm
 from llm_config import gemini_pro_model, gemini_flash_model, get_active_models
@@ -45,7 +54,10 @@ if not getattr(setup_logging, "_boot_logged", False):
     setup_logging._boot_logged = True
 
 # --- 1. 환경변수 및 페이지 설정 ---
-load_dotenv()
+# override=True: .env 키를 수정하면 프로세스 재시작 없이 '재실행'만으로 즉시 반영된다.
+# (기본 override=False면 부팅 시 os.environ에 들어간 옛 키가 남아, .env를 고쳐도
+#  새로고침/재실행으로 갱신되지 않는 문제가 있었다 — 예: 키 재발급 후에도 HTTP 400 잔존)
+load_dotenv(override=True)
 gemini_api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
 google_api_key = os.getenv("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY", "")
 google_cse_id = os.getenv("GOOGLE_CSE_ID") or st.secrets.get("GOOGLE_CSE_ID", "")
@@ -1533,7 +1545,7 @@ auth_user = require_login()
 if st.session_state.get("_logged_user_email") != auth_user["email"]:
     get_logger("AUTH").info(f"로그인 사용자: {auth_user['email']} (role={auth_user['role']})")
     st.session_state._logged_user_email = auth_user["email"]
-render_sidebar_user_panel()
+# 사이드바는 단계 진행 상황 계산 후 아래에서 렌더한다(진행 상황 패널 포함).
 
 # --- 인증 통과 후 메인 헤더 ---
 page_header(
@@ -1579,13 +1591,70 @@ if st.session_state.get('docs'): _completed.add(0)
 if st.session_state.get('finalized_toc'): _completed.add(1)
 if st.session_state.get('draft_proposal'): _completed.add(2)
 if st.session_state.get('final_proposal'): _completed.add(3)
+if st.session_state.get('generated_ppt_file'): _completed.add(4)
 render_stepper(stepper_labels, current_index=active_tab_index, completed=_completed)
+
+# --- 스테퍼 하단 진행 요약 라인 (현재/완료/다음 한눈에) ---
+if 'project_id' in st.session_state:
+    _todo = [i for i in range(len(stepper_labels)) if i not in _completed]
+    if _todo:
+        _ni = _todo[0]
+        st.caption(
+            f"📍 현재 **{active_tab_index + 1}. {stepper_labels[active_tab_index]}** · "
+            f"완료 **{len(_completed)}/{len(stepper_labels)}** · "
+            f"다음 할 일 **{_ni + 1}. {stepper_labels[_ni]}**"
+        )
+    else:
+        st.caption(f"📍 완료 **{len(_completed)}/{len(stepper_labels)}** · 🎉 모든 단계 완료")
+
+
+# --- 사이드바 진행 상황 패널 (세션·단계 인지) ---
+def _render_sidebar_progress():
+    st.markdown("### 진행 상황")
+    if 'project_id' not in st.session_state:
+        st.caption("아직 시작한 프로젝트가 없습니다.\n1단계에서 새 프로젝트를 시작하세요.")
+        return
+    pid = st.session_state.get('project_id')
+    topic = (st.session_state.get('finalized_topic') or '').strip()
+    done = _completed
+    total = len(stepper_labels)
+    pct = int(len(done) / total * 100)
+    rows = []
+    for i, label in enumerate(stepper_labels):
+        if i in done:
+            cls, ic = "appx-prog-done", "✓"
+        elif i == active_tab_index:
+            cls, ic = "appx-prog-current", str(i + 1)
+        else:
+            cls, ic = "appx-prog-todo", str(i + 1)
+        rows.append(
+            f'<div class="appx-prog-step {cls}"><span class="appx-prog-ic">{ic}</span>'
+            f'<span class="appx-prog-label">{label}</span></div>'
+        )
+    todo = [i for i in range(total) if i not in done]
+    if todo:
+        ni = todo[0]
+        next_html = f'<div class="appx-prog-next">다음 할 일 · <b>{ni + 1}. {stepper_labels[ni]}</b></div>'
+    else:
+        next_html = '<div class="appx-prog-next">🎉 모든 단계를 완료했습니다.</div>'
+    topic_html = f'<div class="appx-prog-meta" title="{topic}">📌 {topic}</div>' if topic else ''
+    st.markdown(
+        f'<div class="appx-prog">'
+        f'<div class="appx-prog-meta">프로젝트 #{pid} · {len(done)}/{total} 완료</div>'
+        f'{topic_html}'
+        f'<div class="appx-prog-bar"><i style="width:{pct}%"></i></div>'
+        f'{"".join(rows)}{next_html}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+render_sidebar_user_panel(extra_panel=_render_sidebar_progress)
 
 st.session_state.active_tab = st.radio("Navigation", tab_names, index=active_tab_index, horizontal=True, label_visibility="collapsed")
 
 if st.session_state.active_tab == "1단계: 제안서 시작":
-    st.header("시작 옵션 선택")
-    
+    section_header("제안서 시작", desc="새 프로젝트를 만들고 참고 자료를 업로드합니다.", icon="🚀")
+
     if st.button("🚀 새 제안서 프로젝트 시작하기", use_container_width=True, type="primary"):
         project_id = create_new_project()
         reset_all_state()
@@ -1628,7 +1697,7 @@ elif st.session_state.active_tab == "2단계: 주제/목차 확정":
     if 'project_id' not in st.session_state:
         st.warning("먼저 '1단계'에서 새 프로젝트를 시작해주세요.")
         st.stop()
-    st.header("주제 및 목차 상세화, 확정")
+    section_header("주제·목차 확정", desc="학습 자료 기반으로 주제와 목차를 상세화하고 확정합니다.", icon="🧭")
     if 'docs' not in st.session_state or not st.session_state.docs:
         st.warning("먼저 '1단계'에서 참고 자료를 등록해주세요.")
     
@@ -1643,13 +1712,13 @@ elif st.session_state.active_tab == "2단계: 주제/목차 확정":
                     status.update(label="✅ 주제 추천이 완료되었습니다!", state="complete", expanded=False)
                 st.rerun()
         else:
-            st.subheader("1. AI 추천 주제 선택")
+            sub_section("AI 추천 주제 선택", num=1)
             for topic in st.session_state.recommendations:
                 if st.button(topic, use_container_width=True):
                     st.session_state.selected_topic = topic
                     st.rerun()
             if 'selected_topic' in st.session_state:
-                st.subheader("2. 주제 수정 및 확정")
+                sub_section("주제 수정 및 확정", num=2)
                 st.text_input("선택된 주제 (수정 가능)", value=st.session_state.selected_topic, key="topic_editor")
                 if st.button("이 주제로 최종 확정", type="primary"):
                     st.session_state.finalized_topic = st.session_state.topic_editor
@@ -1660,7 +1729,7 @@ elif st.session_state.active_tab == "2단계: 주제/목차 확정":
     if 'finalized_topic' in st.session_state:
         st.success(f"주제 확정 완료: **{st.session_state.finalized_topic}**")
         st.markdown("---")
-        st.subheader("3. 목차 생성 및 수정")
+        sub_section("목차 생성 및 수정", num=3)
 
         if 'editable_toc' not in st.session_state and 'finalized_toc' not in st.session_state:
             if 'user_core_toc' in st.session_state:
@@ -1698,12 +1767,20 @@ elif st.session_state.active_tab == "2단계: 주제/목차 확정":
                 st.success("목차가 성공적으로 저장/업데이트되었습니다.")
                 st.rerun()
 
+        # --- 동선: 주제·목차 확정 완료 시 다음 단계로 안내 ---
+        if 'finalized_toc' in st.session_state:
+            st.markdown("---")
+            st.success("✅ 주제·목차 확정 완료 — 이제 제안서를 생성할 수 있습니다.")
+            if st.button("다음 단계 → 3단계: 제안서 생성", use_container_width=True, type="primary", key="cta_to_stage3"):
+                st.session_state.active_tab = "3단계: 제안서 생성"
+                st.rerun()
+
         if 'finalized_toc' in st.session_state:
             st.info("준비가 되면 '3단계' 탭으로 이동하여 제안서 생성을 시작하세요.")
 
 elif st.session_state.active_tab == "3단계: 제안서 생성":
     if 'project_id' not in st.session_state: st.warning("먼저 '1단계'에서 새 프로젝트를 시작해주세요."); st.stop()
-    st.header("제안서 자동 생성")
+    section_header("제안서 생성", desc="확정된 주제·목차로 본문을 자동 생성합니다.", icon="🛠")
     if 'finalized_topic' not in st.session_state or 'finalized_toc' not in st.session_state: st.warning("먼저 '2단계'에서 주제와 목차를 모두 확정해주세요."); st.stop()
     
     page_count = st.number_input("목표 페이지 수", min_value=5, max_value=100, value=st.session_state.get('page_count', 15))
@@ -2025,7 +2102,7 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
 
     if 'draft_proposal' in st.session_state:
         st.markdown("---")
-        st.subheader("생성된 제안서 초안")
+        sub_section("생성된 제안서 초안")
         display_text = remove_markdown_headings(st.session_state.draft_proposal)
         st.text_area("초안 내용", value=display_text, height=400)
         cols = st.columns([1, 1, 1])
@@ -2037,7 +2114,7 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
 
         # --- 3단계 재실행 컨트롤 ---
         st.markdown("---")
-        st.markdown("#### 🔁 3단계 재실행")
+        sub_section("3단계 재실행", desc="이전 진행분을 재사용해 이어서 생성합니다.")
         rr1, rr2 = st.columns(2)
         with rr1:
             if st.button("🔁 이어서 재실행 (누락된 섹션만 보강)", use_container_width=True, key="stage3_rerun_resume"):
@@ -2058,8 +2135,15 @@ elif st.session_state.active_tab == "3단계: 제안서 생성":
                 notify("warning", "캐시를 모두 삭제하고 처음부터 재실행합니다.")
                 st.rerun()
 
+        # --- 동선: 초안 생성 완료 시 다음 단계로 안내 ---
+        st.markdown("---")
+        st.success("✅ 제안서 초안 생성 완료 — 다음 단계에서 품질을 검증·개선하세요.")
+        if st.button("다음 단계 → 4단계: 최종 품질 검증", use_container_width=True, type="primary", key="cta_to_stage4"):
+            st.session_state.active_tab = "4단계: 최종 품질 검증"
+            st.rerun()
+
 elif st.session_state.active_tab == "4단계: 최종 품질 검증":
-    st.header("🧐 제안서 최종 품질 검증")
+    section_header("최종 품질 검증", desc="초안을 AI로 검토·개선해 최종본을 만듭니다.", icon="🧐")
     if 'project_id' in st.session_state:
         project_id = st.session_state.project_id
         project_data, stages = get_project_data(project_id)
@@ -2105,7 +2189,7 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
 
             # 최종본이 이미 있으면 재검증 진입로를 항상 노출
             if 'final_proposal' in st.session_state and not st.session_state.draft_loaded_for_review:
-                st.subheader("🔁 재검증 시작")
+                sub_section("재검증 시작")
                 st.caption("이전 최종본이 저장되어 있습니다. 어떤 기준으로 다시 검증할지 선택하세요.")
                 reverify_col1, reverify_col2, reverify_col3 = st.columns(3)
                 with reverify_col1:
@@ -2131,7 +2215,7 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                     st.rerun()
 
             if st.session_state.draft_loaded_for_review:
-                st.subheader("1. 초안 검토 및 수정")
+                sub_section("초안 검토 및 수정", num=1)
                 st.text_area("제안서 초안 (직접 수정 가능)", value=st.session_state.editable_draft_content, height=400, key="editable_draft_content_area")
                 action_col1, action_col2 = st.columns(2)
                 with action_col1:
@@ -2144,7 +2228,7 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                         st.session_state.draft_loaded_for_review = False
                         st.rerun()
                 st.markdown("---")
-                st.subheader("2. AI 최종 검토 실행")
+                sub_section("AI 최종 검토 실행", num=2)
                 st.info("위 초안을 바탕으로 AI가 전체적인 품질을 검토하고 개선합니다. (목차, 본문, 어조 등)")
 
                 review_criteria = st.text_area("품질 검토 기준 (AI에게 전달됩니다)",
@@ -2263,12 +2347,12 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
 
             if 'final_proposal' in st.session_state:
                 st.markdown("---")
-                st.subheader("개선된 제안서 최종본")
+                sub_section("개선된 제안서 최종본")
                 display_text = remove_markdown_headings(st.session_state.final_proposal)
                 st.text_area("최종본 내용", value=display_text, height=400)
 
                 # --- 4단계 재실행 컨트롤 ---
-                st.markdown("#### 🔁 4단계 재실행")
+                sub_section("4단계 재실행", desc="캐시를 재사용해 검증을 다시 실행합니다.")
                 rr1, rr2 = st.columns(2)
                 with rr1:
                     if st.button("🔁 이어서 재실행 (캐시 재사용)", use_container_width=True, key="stage4_rerun_resume"):
@@ -2308,11 +2392,18 @@ elif st.session_state.active_tab == "4단계: 최종 품질 검증":
                     st.download_button(label="📥 최종본 DOCX 다운로드", data=final_docx, file_name=f"[최종본] {project_data['topic']}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
                 with col2:
                     st.download_button(label="📥 최종본 TXT 다운로드", data=display_text.encode('utf-8'), file_name=f"[최종본] {project_data['topic']}.txt", mime="text/plain", use_container_width=True)
+
+                # --- 동선: 최종본 완성 시 다음 단계로 안내 ---
+                st.markdown("---")
+                st.success("✅ 최종본 완성 — 이제 발표용 PPT로 전환할 수 있습니다.")
+                if st.button("다음 단계 → 5단계: PPT 전환", use_container_width=True, type="primary", key="cta_to_stage5"):
+                    st.session_state.active_tab = "5단계: PPT 전환"
+                    st.rerun()
         else: st.error("선택된 프로젝트의 본문 내용을 찾을 수 없습니다.")
     else: st.warning("먼저 '1단계'에서 프로젝트를 시작해주세요.")
 
 elif st.session_state.active_tab == "5단계: PPT 전환":
-    st.header("📝 제안서 기반 PPT 자동 전환")
+    section_header("PPT 전환", desc="완성된 제안서를 발표용 PPT로 자동 변환합니다.", icon="📝")
 
     if 'project_id' in st.session_state:
         project_id = st.session_state.project_id
@@ -2330,7 +2421,7 @@ elif st.session_state.active_tab == "5단계: PPT 전환":
             with st.expander("제안서 원본 보기"):
                 st.text(proposal_content)
 
-            st.subheader("PPT 설정")
+            sub_section("PPT 설정")
             ppt_page_count = st.number_input("목표 슬라이드 수", min_value=5, max_value=20, value=10)
             theme_name = st.selectbox("디자인 테마 선택", options=["심플 (파랑)", "비즈니스 (회색)", "크리에이티브 (보라)", "자연 (초록)", "따뜻함 (주황)"])
             
@@ -2450,6 +2541,18 @@ elif st.session_state.active_tab == "5단계: PPT 전환":
                     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                     use_container_width=True
                 )
+
+                # --- 동선: 전체 워크플로우 완료 안내 ---
+                st.markdown("---")
+                st.success("🎉 모든 단계 완료! 제안서·최종본·PPT가 생성되었습니다.")
+                end1, end2 = st.columns(2)
+                with end1:
+                    if st.button("🗂️ History에서 기록 보기", use_container_width=True, key="cta_to_history"):
+                        st.switch_page("pages/1_History_Dashboard.py")
+                with end2:
+                    if st.button("➕ 새 제안서 시작", use_container_width=True, type="primary", key="cta_new_project"):
+                        st.session_state.active_tab = "1단계: 제안서 시작"
+                        st.rerun()
         else:
             st.error("선택된 프로젝트의 본문 내용을 찾을 수 없습니다.")
     else:

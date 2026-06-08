@@ -10,14 +10,17 @@ import warnings
 from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)  # .env 키 수정 시 재시작 없이 반영
 
 # SSL 경고 메시지를 비활성화합니다.
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 # --- LLM 관련 라이브러리 추가 ---
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
+try:
+    from langchain_core.prompts import PromptTemplate
+except ImportError:
+    from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")

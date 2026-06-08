@@ -20,11 +20,23 @@ except Exception:
     import logging
     _log = logging.getLogger("auth")
 
+# 쿠키 매니저(로그인 저장)는 선택 의존성 — 미설치 시에도 앱은 정상 동작한다.
+try:
+    import extra_streamlit_components as stx
+    _HAS_COOKIES = True
+except Exception:
+    stx = None
+    _HAS_COOKIES = False
+
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.db")
 ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "orion0321@gmail.com").strip().lower()
 
 PBKDF2_ITERATIONS = 260000
 PBKDF2_ALGO = "sha256"
+
+# 로그인 저장(자동 로그인) 설정
+REMEMBER_COOKIE = "plan_agent_remember"
+REMEMBER_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +68,17 @@ def ensure_users_table():
             approved_by TEXT,
             last_login_at TEXT,
             note TEXT
+        )
+        """
+    )
+    # 로그인 저장(자동 로그인)용 토큰 테이블 — 평문 토큰은 저장하지 않고 해시만 보관한다.
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_tokens (
+            token_hash TEXT PRIMARY KEY,
+            email      TEXT NOT NULL COLLATE NOCASE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
         )
         """
     )
@@ -223,6 +246,90 @@ def delete_user(email: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 로그인 저장(자동 로그인) — 쿠키 + 해시 토큰
+# ---------------------------------------------------------------------------
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_remember_token(email: str) -> str:
+    """평문 토큰을 발급하고 해시만 DB에 저장한다. 평문은 쿠키에만 보관된다."""
+    ensure_users_table()
+    token = secrets.token_urlsafe(32)
+    now = datetime.datetime.now()
+    expires = now + datetime.timedelta(days=REMEMBER_DAYS)
+    conn = _connect()
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO auth_tokens (token_hash, email, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (_hash_token(token), email.strip().lower(),
+         now.strftime("%Y-%m-%d %H:%M:%S"), expires.strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    # 만료 토큰 정리(주기적 청소 대용)
+    c.execute("DELETE FROM auth_tokens WHERE expires_at < ?", (now.strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.commit()
+    conn.close()
+    return token
+
+
+def consume_remember_token(token: str) -> str | None:
+    """유효한(미만료) 토큰이면 해당 이메일을 반환한다. 아니면 None."""
+    if not token:
+        return None
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT email, expires_at FROM auth_tokens WHERE token_hash = ?", (_hash_token(token),))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        if datetime.datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S") < datetime.datetime.now():
+            revoke_remember_token(token)
+            return None
+    except Exception:
+        return None
+    return row["email"]
+
+
+def revoke_remember_token(token: str) -> None:
+    if not token:
+        return
+    try:
+        conn = _connect()
+        c = conn.cursor()
+        c.execute("DELETE FROM auth_tokens WHERE token_hash = ?", (_hash_token(token),))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def build_cookie_manager():
+    """매 스크립트 실행마다 CookieManager를 새로 생성해 쿠키를 다시 읽어온다.
+    (CookieManager.get()은 생성 시점의 캐시를 읽으므로 인스턴스를 재사용하면
+    최신 쿠키를 못 읽는다 → 실행당 1회 require_login에서만 호출한다.)"""
+    if not _HAS_COOKIES:
+        st.session_state["_cookie_manager"] = None
+        return None
+    try:
+        cm = stx.CookieManager(key="plan_agent_cookies")
+    except Exception:
+        cm = None
+    st.session_state["_cookie_manager"] = cm
+    return cm
+
+
+def get_cookie_manager():
+    """현재 실행에서 build된 CookieManager를 반환(없으면 1회 생성). 미설치 시 None."""
+    cm = st.session_state.get("_cookie_manager")
+    if cm is None and _HAS_COOKIES:
+        cm = build_cookie_manager()
+    return cm
+
+
+# ---------------------------------------------------------------------------
 # 로그인 / 세션
 # ---------------------------------------------------------------------------
 def authenticate(email: str, password: str) -> tuple[bool, str, dict | None]:
@@ -264,6 +371,16 @@ def is_admin() -> bool:
 
 
 def logout():
+    # 자동 로그인 토큰/쿠키 정리
+    try:
+        cm = get_cookie_manager()
+        token = cm.get(REMEMBER_COOKIE) if cm else None
+        if token:
+            revoke_remember_token(token)
+        if cm:
+            cm.delete(REMEMBER_COOKIE, key="logout_del_remember")
+    except Exception:
+        pass
     for k in ("auth_user", "auth_login_time"):
         st.session_state.pop(k, None)
 
@@ -273,15 +390,42 @@ def logout():
 # ---------------------------------------------------------------------------
 def _render_login_form():
     st.subheader("🔐 로그인")
+    # 직전에 '로그인 저장'으로 저장해 둔 이메일이 있으면 미리 채워 준다.
+    saved_email = ""
+    try:
+        cm = get_cookie_manager()
+        if cm:
+            saved_email = cm.get("plan_agent_email") or ""
+    except Exception:
+        saved_email = ""
     with st.form("login_form", clear_on_submit=False):
-        email = st.text_input("이메일", key="login_email").strip().lower()
+        email = st.text_input("이메일", value=saved_email, key="login_email").strip().lower()
         password = st.text_input("비밀번호", type="password", key="login_password")
+        remember = st.checkbox(
+            "로그인 저장 (이 브라우저에서 30일간 자동 로그인)",
+            value=bool(saved_email),
+            key="login_remember",
+        )
         submitted = st.form_submit_button("로그인", use_container_width=True, type="primary")
         if submitted:
             ok, msg, user = authenticate(email, password)
             if ok:
                 st.session_state.auth_user = user
                 st.session_state.auth_login_time = datetime.datetime.now().isoformat()
+                # 로그인 저장 처리: 자동 로그인 토큰 + 이메일 쿠키 발급/삭제
+                try:
+                    cm = get_cookie_manager()
+                    if cm:
+                        expires = datetime.datetime.now() + datetime.timedelta(days=REMEMBER_DAYS)
+                        if remember:
+                            token = issue_remember_token(email)
+                            cm.set(REMEMBER_COOKIE, token, expires_at=expires, key="set_remember")
+                            cm.set("plan_agent_email", email, expires_at=expires, key="set_email")
+                        else:
+                            cm.delete(REMEMBER_COOKIE, key="del_remember")
+                            cm.delete("plan_agent_email", key="del_email")
+                except Exception as _ce:
+                    _log.warning(f"로그인 저장 쿠키 처리 실패(무시): {_ce}")
                 st.success(msg)
                 st.rerun()
             else:
@@ -361,10 +505,42 @@ def render_login_page():
         _render_register_form()
 
 
+def _try_cookie_autologin():
+    """세션에 로그인 정보가 없을 때 쿠키의 자동 로그인 토큰으로 복원을 시도한다."""
+    if current_user() or not _HAS_COOKIES:
+        return
+    try:
+        cm = get_cookie_manager()
+        if not cm:
+            return
+        token = cm.get(REMEMBER_COOKIE)
+        if not token:
+            return
+        email = consume_remember_token(token)
+        if not email:
+            return
+        fresh = get_user(email)
+        if fresh and fresh.get("status") == "approved":
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn = _connect()
+            c = conn.cursor()
+            c.execute("UPDATE users SET last_login_at = ? WHERE email = ? COLLATE NOCASE", (now, email))
+            conn.commit()
+            conn.close()
+            fresh["last_login_at"] = now
+            st.session_state.auth_user = fresh
+            st.session_state.auth_login_time = datetime.datetime.now().isoformat()
+            _log.info(f"자동 로그인(쿠키) 성공: {email}")
+    except Exception as _e:
+        _log.warning(f"자동 로그인 시도 실패(무시): {_e}")
+
+
 def require_login():
     """모든 페이지 진입 전에 호출. 미로그인 시 로그인 화면을 그리고 st.stop() 한다."""
     ensure_users_table()
     seed_admin()
+    build_cookie_manager()   # 실행당 1회: 최신 쿠키 로드
+    _try_cookie_autologin()
     user = current_user()
     if not user:
         render_login_page()
@@ -380,19 +556,62 @@ def require_login():
     return fresh
 
 
-def render_sidebar_user_panel():
-    """사이드바에 현재 로그인 정보 + 로그아웃 버튼을 그린다."""
+def render_sidebar_user_panel(extra_panel=None):
+    """사이드바에 현재 로그인 정보 + 로그아웃 버튼을 그린다.
+    extra_panel: 선택적 콜백. 계정 카드와 푸터 사이에 추가 패널(예: 단계 진행 상황)을 렌더한다."""
     user = current_user()
     if not user:
         return
+    email = str(user.get("email", ""))
+    role = str(user.get("role", "user"))
+    initial = (email[:1] or "U").upper()
+    is_adm = role == "admin"
+    role_cls = "appx-role-admin" if is_adm else "appx-role-user"
+    role_label = "👑 ADMIN" if is_adm else "USER"
+    avatar_cls = "appx-avatar appx-avatar-admin" if is_adm else "appx-avatar"
+    last_login = str(user.get("last_login_at") or "").strip()
     with st.sidebar:
-        st.markdown("### 👤 사용자")
-        st.caption(f"{user['email']}  ·  `{user['role']}`")
-        if st.button("로그아웃", use_container_width=True, key="sidebar_logout"):
+        # 브랜드 (로고 칩 + 타이틀 + 서브)
+        st.markdown(
+            '<div class="appx-brand">'
+            '<div class="appx-brand-logo">🤖</div>'
+            '<div><div class="appx-brand-title">제안서 Agent</div>'
+            '<div class="appx-brand-sub">AI Proposal Suite</div></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("### 계정")
+        st.markdown(
+            f'<div class="appx-usercard">'
+            f'<div class="{avatar_cls}">{initial}</div>'
+            f'<div class="appx-user-meta">'
+            f'<div class="appx-user-email" title="{email}">{email}</div>'
+            f'<span class="appx-role-badge {role_cls}">{role_label}</span>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        if last_login:
+            st.markdown(f'<div class="appx-lastlogin">최근 로그인 · {last_login}</div>', unsafe_allow_html=True)
+        if st.button("🚪 로그아웃", use_container_width=True, key="sidebar_logout"):
             logout()
             st.rerun()
+        # 호출자가 넘긴 추가 패널(예: 메인 앱의 단계 진행 상황)을 계정 카드 아래에 렌더
+        if extra_panel is not None:
+            try:
+                extra_panel()
+            except Exception as _ep:
+                _log.warning(f"사이드바 추가 패널 렌더 실패(무시): {_ep}")
         if is_admin():
+            st.markdown("### 관리")
             render_admin_panel_sidebar()
+        # 푸터 (가동 상태 + 버전)
+        st.markdown(
+            '<div class="appx-sidebar-footer">'
+            '<span class="appx-foot-dot"></span> 온라인'
+            '<span class="appx-foot-ver">v5.1 · 2026</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def render_admin_panel_sidebar():

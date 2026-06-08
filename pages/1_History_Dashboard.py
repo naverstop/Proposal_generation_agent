@@ -77,57 +77,6 @@ def create_docx_from_db(content):
     document.save(bio)
     return bio.getvalue()
 
-st.markdown("""
-<style>
-.appx-board-wrap {
-    background: var(--appx-surface);
-    border: 1px solid var(--appx-border);
-    border-radius: var(--appx-radius-md);
-    box-shadow: var(--appx-shadow-sm);
-    overflow: hidden;
-    margin-top: 8px;
-}
-.appx-board-head, .appx-board-row {
-    display: grid;
-    grid-template-columns: 70px 1fr 180px 220px;
-    align-items: center;
-    gap: 0;
-    padding: 0 16px;
-}
-.appx-board-head {
-    background: var(--appx-bg-soft, #f5f7fa);
-    border-bottom: 1px solid var(--appx-border);
-    height: 42px;
-    font-size: 0.82rem;
-    font-weight: 700;
-    color: var(--appx-text-muted);
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-}
-.appx-board-row {
-    min-height: 56px;
-    border-bottom: 1px solid var(--appx-border);
-    transition: background 0.12s ease;
-}
-.appx-board-row:hover { background: var(--appx-bg-soft, #f8fafc); }
-.appx-board-row:last-child { border-bottom: none; }
-.appx-board-id      { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--appx-text-muted); font-size: 0.88rem; }
-.appx-board-topic   { font-weight: 600; color: var(--appx-text); font-size: 0.95rem;
-                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 12px; }
-.appx-board-topic .untitled { color: var(--appx-text-muted); font-weight: 400; font-style: italic; }
-.appx-board-date    { color: var(--appx-text-muted); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
-.appx-board-actions { display: flex; }
-/* Streamlit 버튼을 행 안에 컴팩트하게 */
-.appx-board-row [data-testid="stHorizontalBlock"] { gap: 6px !important; }
-.appx-board-row .stButton > button {
-    padding: 4px 10px !important;
-    min-height: 32px !important;
-    font-size: 0.82rem !important;
-    border-radius: 6px !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
 page_header(
     title="🗂️ 생성 기록 대시보드",
     subtitle="과거에 생성한 모든 제안서 프로젝트를 확인하고 관리합니다.",
@@ -144,23 +93,23 @@ else:
 
     # 게시판 헤더
     h1, h2, h3, h4 = st.columns([0.7, 4, 2, 2.4])
-    with h1: st.markdown('<div style="font-size:0.78rem;font-weight:700;color:var(--appx-text-muted);text-transform:uppercase;letter-spacing:0.04em;padding:6px 0;border-bottom:2px solid var(--appx-border);">ID</div>', unsafe_allow_html=True)
-    with h2: st.markdown('<div style="font-size:0.78rem;font-weight:700;color:var(--appx-text-muted);text-transform:uppercase;letter-spacing:0.04em;padding:6px 0;border-bottom:2px solid var(--appx-border);">주제</div>', unsafe_allow_html=True)
-    with h3: st.markdown('<div style="font-size:0.78rem;font-weight:700;color:var(--appx-text-muted);text-transform:uppercase;letter-spacing:0.04em;padding:6px 0;border-bottom:2px solid var(--appx-border);">생성일</div>', unsafe_allow_html=True)
-    with h4: st.markdown('<div style="font-size:0.78rem;font-weight:700;color:var(--appx-text-muted);text-transform:uppercase;letter-spacing:0.04em;padding:6px 0;border-bottom:2px solid var(--appx-border);text-align:center;">작업</div>', unsafe_allow_html=True)
+    with h1: st.markdown('<div class="appx-th">ID</div>', unsafe_allow_html=True)
+    with h2: st.markdown('<div class="appx-th">주제</div>', unsafe_allow_html=True)
+    with h3: st.markdown('<div class="appx-th">생성일</div>', unsafe_allow_html=True)
+    with h4: st.markdown('<div class="appx-th appx-th-center">작업</div>', unsafe_allow_html=True)
 
     for project in projects:
         topic_html = (
             f'<span>{project["topic"]}</span>' if project["topic"]
-            else '<span style="color:var(--appx-text-muted);font-style:italic;font-weight:400;">(제목 미확정)</span>'
+            else '<span class="appx-untitled">(제목 미확정)</span>'
         )
         c1, c2, c3, c4 = st.columns([0.7, 4, 2, 2.4])
         with c1:
-            st.markdown(f'<div style="font-family:ui-monospace,monospace;color:var(--appx-text-muted);font-size:0.88rem;padding:10px 0;">#{project["id"]}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="appx-td appx-td-id">#{project["id"]}</div>', unsafe_allow_html=True)
         with c2:
-            st.markdown(f'<div style="padding:10px 8px 10px 0;font-weight:600;font-size:0.95rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{topic_html}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="appx-td appx-td-topic">{topic_html}</div>', unsafe_allow_html=True)
         with c3:
-            st.markdown(f'<div style="padding:10px 0;color:var(--appx-text-muted);font-size:0.85rem;font-variant-numeric:tabular-nums;">{project["timestamp"]}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="appx-td appx-td-date">{project["timestamp"]}</div>', unsafe_allow_html=True)
         with c4:
             bc1, bc2 = st.columns(2)
             with bc1:

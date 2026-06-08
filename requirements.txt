@@ -4,6 +4,7 @@
 
 # --- 핵심 프레임워크 ---
 streamlit>=1.35.0
+extra-streamlit-components>=0.1.71   # 로그인 저장(쿠키) 기능용
 
 # --- AI / LLM ---
 langchain>=0.3.26
